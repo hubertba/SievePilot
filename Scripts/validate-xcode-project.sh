@@ -30,7 +30,35 @@ validate_sources() {
   echo 'Validated SievePilot app sources'
 }
 
+validate_project() {
+  validate_sources
+  local project=SievePilot.xcodeproj/project.pbxproj
+  local scheme=SievePilot.xcodeproj/xcshareddata/xcschemes/SievePilot.xcscheme
+  require_file "$project"
+  require_file SievePilot.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+  require_file "$scheme"
+  plutil -lint "$project" >/dev/null || fail "invalid project.pbxproj syntax"
+  require_text "$project" 'productName = SievePilot;'
+  require_text "$project" 'productName = SievePilotAppTests;'
+  require_text "$project" 'AppModel.swift in Sources'
+  require_text "$project" 'SievePilotApp.swift in Sources'
+  require_text "$project" 'Assets.xcassets in Resources'
+  require_text "$project" 'AppModelTests.swift in Sources'
+  require_text "$project" 'relativePath = .;'
+  require_text "$project" 'productName = SievePilotCore;'
+  require_text "$project" 'SievePilotCore in Frameworks'
+  require_text "$project" 'MACOSX_DEPLOYMENT_TARGET = 13.0;'
+  require_text "$project" 'GENERATE_INFOPLIST_FILE = YES;'
+  require_text "$project" 'INFOPLIST_KEY_LSUIElement = YES;'
+  require_text "$project" 'PRODUCT_BUNDLE_IDENTIFIER = com.hubertba.SievePilot;'
+  require_text "$project" 'PRODUCT_BUNDLE_IDENTIFIER = com.hubertba.SievePilotTests;'
+  require_text "$scheme" 'BlueprintIdentifier="400000000000000000000001"'
+  require_text "$scheme" 'BlueprintIdentifier="400000000000000000000002"'
+  echo 'Validated SievePilot Xcode project'
+}
+
 case "$mode" in
   sources) validate_sources ;;
+  project) validate_project ;;
   *) fail "unsupported validation mode: $mode" ;;
 esac
