@@ -10,6 +10,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "SievePilotCore"),
-        .testTarget(name: "SievePilotCoreTests", dependencies: ["SievePilotCore"])
+        .testTarget(
+            name: "SievePilotCoreTests",
+            dependencies: ["SievePilotCore"],
+            resources: [.process("Fixtures")]
+        )
     ]
 )
