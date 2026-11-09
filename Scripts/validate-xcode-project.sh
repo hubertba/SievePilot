@@ -37,25 +37,16 @@ validate_project() {
   require_file "$project"
   require_file SievePilot.xcodeproj/project.xcworkspace/contents.xcworkspacedata
   require_file "$scheme"
+  require_file Scripts/validate_xcode_project.py
   plutil -lint "$project" >/dev/null || fail "invalid project.pbxproj syntax"
-  require_text "$project" 'productName = SievePilot;'
-  require_text "$project" 'productName = SievePilotAppTests;'
-  require_text "$project" 'AppModel.swift in Sources'
-  require_text "$project" 'SievePilotApp.swift in Sources'
-  require_text "$project" 'Assets.xcassets in Resources'
-  require_text "$project" 'AppModelTests.swift in Sources'
-  require_text "$project" 'relativePath = .;'
-  require_text "$project" 'productName = SievePilotCore;'
-  require_text "$project" 'SievePilotCore in Frameworks'
-  require_text "$project" 'MACOSX_DEPLOYMENT_TARGET = 13.0;'
-  require_text "$project" 'ONLY_ACTIVE_ARCH = YES;'
-  require_text "$project" 'ENABLE_TESTABILITY = YES;'
-  require_text "$project" 'GENERATE_INFOPLIST_FILE = YES;'
-  require_text "$project" 'INFOPLIST_KEY_LSUIElement = YES;'
-  require_text "$project" 'PRODUCT_BUNDLE_IDENTIFIER = com.hubertba.SievePilot;'
-  require_text "$project" 'PRODUCT_BUNDLE_IDENTIFIER = com.hubertba.SievePilotTests;'
-  require_text "$scheme" 'BlueprintIdentifier="400000000000000000000001"'
-  require_text "$scheme" 'BlueprintIdentifier="400000000000000000000002"'
+  local project_json
+  project_json=$(mktemp)
+  plutil -convert json -o "$project_json" "$project"
+  if ! python3 Scripts/validate_xcode_project.py "$project_json" "$scheme"; then
+    rm -f "$project_json"
+    return 1
+  fi
+  rm -f "$project_json"
   echo 'Validated SievePilot Xcode project'
 }
 
