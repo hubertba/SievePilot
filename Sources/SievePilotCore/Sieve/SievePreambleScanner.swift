@@ -95,6 +95,10 @@ struct SieveByteLexer {
             case 0x09, 0x0a, 0x0c, 0x0d, 0x20:
                 index += 1
             case 0x23:
+                if hasASCII("# BEGIN SIEVEPILOT", at: index)
+                    || hasASCII("# END SIEVEPILOT", at: index) {
+                    return index
+                }
                 index += 1
                 while index < bytes.count, bytes[index] != 0x0a { index += 1 }
                 if index < bytes.count { index += 1 }
