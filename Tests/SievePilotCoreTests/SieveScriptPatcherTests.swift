@@ -111,6 +111,60 @@ import Testing
         #expect(removing(firstMetadata, from: first) == removing(secondMetadata, from: second))
     }
 
+    @Test func testUpdateAndDisablePreserveWhitespaceBetweenOwnedSections() throws {
+        let original = Data("keep;\n".utf8)
+        let enabled = try enable(original, message: "Away", metadata: metadata(version: 1))
+        let sections = try parsed(enabled)
+        let firstGap = Data("\r\n \t\r\n".utf8)
+        let secondGap = Data("\n\t \n".utf8)
+        var withGaps = enabled
+        withGaps.insert(contentsOf: secondGap, at: sections.outOfOfficeRule!.lowerBound)
+        withGaps.insert(contentsOf: firstGap, at: sections.requirements!.lowerBound)
+
+        let updated = try enable(withGaps, message: "Updated", metadata: metadata(version: 2))
+        let updatedSections = try parsed(updated)
+        #expect(Data(updated[updatedSections.metadata!.upperBound..<updatedSections.requirements!.lowerBound]) == firstGap)
+        #expect(Data(updated[updatedSections.requirements!.upperBound..<updatedSections.outOfOfficeRule!.lowerBound]) == secondGap)
+
+        let disabled = try SieveScriptPatcher.apply(
+            .disable,
+            to: updated,
+            metadata: metadata(version: 3),
+            accountID: accountID
+        )
+        let disabledSections = try parsed(disabled)
+        #expect(Data(disabled[disabledSections.metadata!.upperBound...]) == joined(firstGap, secondGap, original))
+    }
+
+    @Test func testInlineMarkerLookingCommentRemainsInlineAcrossLifecycle() throws {
+        let original = Data("require \"fileinto\"; # BEGIN SIEVEPILOT METADATA v1\nkeep;\n".utf8)
+        let enabled = try enable(original, message: "Away", metadata: metadata(version: 1))
+        let updated = try enable(enabled, message: "Updated", metadata: metadata(version: 2))
+        let disabled = try SieveScriptPatcher.apply(
+            .disable,
+            to: updated,
+            metadata: metadata(version: 3),
+            accountID: accountID
+        )
+        let sections = try parsed(disabled)
+
+        #expect(removing(sections.metadata!, from: disabled) == original)
+    }
+
+    @Test func testRejectsMalformedMetadataBeforeMutation() throws {
+        let malformed = Data("""
+        # BEGIN SIEVEPILOT METADATA v1
+        # account-id: \(accountID.sieveToken)
+        # predecessor-sha256: \(String(repeating: "a", count: 64))
+        # END SIEVEPILOT METADATA v1
+        keep;
+        """.utf8)
+
+        #expect(throws: SieveScriptPatcherError.invalidManagedMetadata) {
+            try enable(malformed, message: "Away", metadata: metadata(version: 2))
+        }
+    }
+
     @Test func testRejectsMetadataAccountMismatch() throws {
         let original = Data("keep;\n".utf8)
         let otherID = AccountID(
@@ -121,7 +175,7 @@ import Testing
             try SieveScriptPatcher.apply(
                 .enable(configuration(message: "Away")),
                 to: original,
-                metadata: ManagedScriptMetadata(
+                metadata: try ManagedScriptMetadata(
                     accountID: otherID,
                     versionID: UUID(),
                     predecessorSHA256: nil
@@ -150,10 +204,21 @@ import Testing
     }
 
     private func metadata(version: Int) -> ManagedScriptMetadata {
-        ManagedScriptMetadata(
+        try! ManagedScriptMetadata(
             accountID: accountID,
             versionID: UUID(uuidString: String(format: "00000000-0000-4000-8000-%012d", version))!,
-            predecessorSHA256: "abc123"
+            predecessorSHA256: String(repeating: "a", count: 64)
+        )
+    }
+
+    private func rendered(
+        message: String,
+        metadata: ManagedScriptMetadata
+    ) throws -> RenderedManagedSections {
+        try ManagedSectionRenderer.renderOutOfOffice(
+            configuration: configuration(message: message),
+            metadata: metadata,
+            lineEnding: .lf
         )
     }
 
@@ -179,5 +244,9 @@ import Testing
         var copy = data
         copy.removeSubrange(range)
         return copy
+    }
+
+    private func joined(_ parts: Data...) -> Data {
+        parts.reduce(into: Data()) { $0.append($1) }
     }
 }

@@ -108,10 +108,10 @@ import Testing
         let accountID = AccountID(
             rawValue: UUID(uuidString: "8CBCBCC8-2E3C-49BE-9464-A238AD398005")!
         )
-        let metadata = ManagedScriptMetadata(
+        let metadata = try ManagedScriptMetadata(
             accountID: accountID,
             versionID: UUID(uuidString: "D69D1F7D-7178-4A97-A801-EAE36BB7E05E")!,
-            predecessorSHA256: "8c675"
+            predecessorSHA256: String(repeating: "a", count: 64)
         )
         let configuration = try OutOfOfficeConfiguration(
             emailAddress: "user@example.com",

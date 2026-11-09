@@ -45,7 +45,10 @@ public enum ManagedSectionRenderer {
         let handle = try string(
             encoding: "sievepilot-out-of-office-\(metadata.accountID.sieveToken)"
         )
-        let message = try string(encoding: configuration.message)
+        let message = String(
+            decoding: try SieveStringEncoder.encodeMessageQuoted(configuration.message),
+            as: UTF8.self
+        )
         let expiry = utcTimestamp(configuration.expiry.instant)
 
         let requirements = [

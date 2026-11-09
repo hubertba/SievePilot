@@ -95,10 +95,7 @@ struct SieveByteLexer {
             case 0x09, 0x0a, 0x0c, 0x0d, 0x20:
                 index += 1
             case 0x23:
-                if hasASCII("# BEGIN SIEVEPILOT", at: index)
-                    || hasASCII("# END SIEVEPILOT", at: index) {
-                    return index
-                }
+                if isReservedMarkerLine(at: index) { return index }
                 index += 1
                 while index < bytes.count, bytes[index] != 0x0a { index += 1 }
                 if index < bytes.count { index += 1 }
@@ -166,8 +163,6 @@ struct SieveByteLexer {
                 return index + 1
             case 0x5c:
                 index += 2
-            case 0x0a, 0x0d:
-                throw SievePreambleError.malformedString
             default:
                 index += 1
             }
@@ -201,6 +196,16 @@ struct SieveByteLexer {
         return zip(bytes[start..<(start + expected.count)], expected).allSatisfy {
             asciiLowercased($0.0) == asciiLowercased($0.1)
         }
+    }
+
+    private func isReservedMarkerLine(at index: Int) -> Bool {
+        guard hasASCII("# BEGIN SIEVEPILOT", at: index)
+                || hasASCII("# END SIEVEPILOT", at: index) else {
+            return false
+        }
+        var lineStart = index
+        while lineStart > 0, bytes[lineStart - 1] != 0x0a { lineStart -= 1 }
+        return bytes[lineStart..<index].allSatisfy { $0 == 0x09 || $0 == 0x20 || $0 == 0x0d }
     }
 
     private func blockCommentEnd(from start: Int) -> Int? {

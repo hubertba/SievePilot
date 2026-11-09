@@ -40,4 +40,40 @@ import Testing
         #expect(accountID.sieveToken == "8cbcbcc8-2e3c-49be-9464-a238ad398005")
         #expect(accountID.sieveToken.range(of: "^[a-z0-9-]+$", options: .regularExpression) != nil)
     }
+
+    @Test func testRejectsUnsafePredecessorSHA256() {
+        let accountID = AccountID(rawValue: UUID())
+        for unsafe in [
+            "abc",
+            String(repeating: "g", count: 64),
+            String(repeating: "a", count: 63) + "\nkeep;",
+            String(repeating: "a", count: 63) + "#"
+        ] {
+            #expect(throws: (any Error).self) {
+                _ = try ManagedScriptMetadata(
+                    accountID: accountID,
+                    versionID: UUID(),
+                    predecessorSHA256: unsafe
+                )
+            }
+        }
+    }
+
+    @Test func testDecodingRejectsUnsafePredecessorSHA256() throws {
+        let valid = try ManagedScriptMetadata(
+            accountID: AccountID(rawValue: UUID()),
+            versionID: UUID(),
+            predecessorSHA256: String(repeating: "a", count: 64)
+        )
+        let encoded = try JSONEncoder().encode(valid)
+        let unsafe = Data(
+            String(decoding: encoded, as: UTF8.self)
+                .replacingOccurrences(of: String(repeating: "a", count: 64), with: "unsafe")
+                .utf8
+        )
+
+        #expect(throws: (any Error).self) {
+            try JSONDecoder().decode(ManagedScriptMetadata.self, from: unsafe)
+        }
+    }
 }

@@ -35,11 +35,38 @@ import Testing
         #expect(rule.contains(":subject \"Out of office\""))
     }
 
-    @Test func testUsesRequestedCRLFLineEndings() throws {
-        let metadata = ManagedScriptMetadata(
+    @Test func testRendersMultilineMessageAsExactQuotedString() throws {
+        let metadata = try ManagedScriptMetadata(
             accountID: accountID,
             versionID: UUID(uuidString: "D69D1F7D-7178-4A97-A801-EAE36BB7E05E")!,
-            predecessorSHA256: "8c675"
+            predecessorSHA256: String(repeating: "a", count: 64)
+        )
+        let multiline = try OutOfOfficeConfiguration(
+            emailAddress: "user@example.com",
+            subject: "Away",
+            message: "Line one\n.Line two\n",
+            expiry: ResolvedExpiry(
+                instant: ISO8601DateFormatter().date(from: "2026-04-24T15:00:00Z")!,
+                timeZoneIdentifier: "Europe/Warsaw",
+                utcOffsetSeconds: 7_200
+            )
+        )
+
+        let sections = try ManagedSectionRenderer.renderOutOfOffice(
+            configuration: multiline,
+            metadata: metadata,
+            lineEnding: .lf
+        )
+        let rule = String(decoding: sections.rule, as: UTF8.self)
+
+        #expect(rule.contains("        \"Line one\n.Line two\n\";"))
+    }
+
+    @Test func testUsesRequestedCRLFLineEndings() throws {
+        let metadata = try ManagedScriptMetadata(
+            accountID: accountID,
+            versionID: UUID(uuidString: "D69D1F7D-7178-4A97-A801-EAE36BB7E05E")!,
+            predecessorSHA256: String(repeating: "a", count: 64)
         )
         let sections = try ManagedSectionRenderer.renderOutOfOffice(
             configuration: configuration(subject: "Away"),
@@ -55,10 +82,10 @@ import Testing
     }
 
     private func render(subject: String?) throws -> RenderedManagedSections {
-        let metadata = ManagedScriptMetadata(
+        let metadata = try ManagedScriptMetadata(
             accountID: accountID,
             versionID: UUID(uuidString: "D69D1F7D-7178-4A97-A801-EAE36BB7E05E")!,
-            predecessorSHA256: "8c675"
+            predecessorSHA256: String(repeating: "a", count: 64)
         )
         return try ManagedSectionRenderer.renderOutOfOffice(
             configuration: configuration(subject: subject),

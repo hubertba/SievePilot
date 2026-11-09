@@ -28,7 +28,8 @@ public enum OutOfOfficeStateEvaluator {
         do {
             let preamble = try SievePreambleScanner.scan(activeScript)
             let sections = try ManagedSectionParser.parse(activeScript, preamble: preamble)
-            guard sections.metadata != nil else { return .off }
+            guard let metadataRange = sections.metadata else { return .off }
+            let metadata = try ManagedScriptMetadataParser.parse(Data(activeScript[metadataRange]))
             guard
                 let requirementsRange = sections.requirements,
                 let ruleRange = sections.outOfOfficeRule
@@ -37,7 +38,11 @@ public enum OutOfOfficeStateEvaluator {
             }
 
             try validateRequirements(Data(activeScript[requirementsRange]))
-            let configuration = try parseRule(Data(activeScript[ruleRange]))
+            var ruleParser = try GeneratedRuleParser(
+                data: Data(activeScript[ruleRange]),
+                accountID: metadata.accountID
+            )
+            let configuration = try ruleParser.parse()
             if now < configuration.expiryInstant {
                 return .on(configuration: configuration)
             }
@@ -48,63 +53,89 @@ public enum OutOfOfficeStateEvaluator {
     }
 
     private static func validateRequirements(_ data: Data) throws {
-        let actual = normalize(data).trimmingCharacters(in: .newlines)
-        let expected = """
-        # BEGIN SIEVEPILOT REQUIREMENTS v1
-        require ["vacation", "date", "relational"];
-        # END SIEVEPILOT REQUIREMENTS v1
-        """
-        guard actual == expected else { throw RuleParseError.invalidRequirements }
+        guard let source = String(data: data, encoding: .utf8) else {
+            throw RuleParseError.invalidUTF8
+        }
+        let newline: String
+        if source.hasPrefix("# BEGIN SIEVEPILOT REQUIREMENTS v1\r\n") {
+            newline = "\r\n"
+        } else if source.hasPrefix("# BEGIN SIEVEPILOT REQUIREMENTS v1\n") {
+            newline = "\n"
+        } else {
+            throw RuleParseError.invalidRequirements
+        }
+        let expected = [
+            "# BEGIN SIEVEPILOT REQUIREMENTS v1",
+            "require [\"vacation\", \"date\", \"relational\"];",
+            "# END SIEVEPILOT REQUIREMENTS v1",
+            ""
+        ].joined(separator: newline)
+        guard source == expected else { throw RuleParseError.invalidRequirements }
+    }
+}
+
+private struct GeneratedRuleParser {
+    let source: String
+    let accountID: AccountID
+    let newline: String
+    var cursor: String.Index
+
+    init(data: Data, accountID: AccountID) throws {
+        guard let source = String(data: data, encoding: .utf8) else {
+            throw RuleParseError.invalidUTF8
+        }
+        let marker = "# BEGIN SIEVEPILOT RULE v1: out-of-office"
+        let newline: String
+        if source.hasPrefix(marker + "\r\n") {
+            newline = "\r\n"
+        } else if source.hasPrefix(marker + "\n") {
+            newline = "\n"
+        } else {
+            throw RuleParseError.invalidRule
+        }
+        self.source = source
+        self.accountID = accountID
+        self.newline = newline
+        cursor = source.startIndex
     }
 
-    private static func parseRule(_ data: Data) throws -> ParsedOutOfOfficeConfiguration {
-        var lines = normalize(data).components(separatedBy: "\n")
-        if lines.last == "" { lines.removeLast() }
-        guard lines.count == 8 || lines.count == 9 else { throw RuleParseError.invalidRule }
-        guard lines[0] == "# BEGIN SIEVEPILOT RULE v1: out-of-office" else {
-            throw RuleParseError.invalidRule
-        }
-        guard lines[2] == "    vacation" else { throw RuleParseError.invalidRule }
-        guard lines[lines.count - 2] == "}" else { throw RuleParseError.invalidRule }
-        guard lines[lines.count - 1] == "# END SIEVEPILOT RULE v1: out-of-office" else {
-            throw RuleParseError.invalidRule
-        }
-
-        let expiryText = try enclosed(
-            lines[1],
-            prefix: "if currentdate :zone \"+0000\" :value \"lt\" \"iso8601\" \"",
-            suffix: "\" {"
-        )
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        guard let expiry = formatter.date(from: expiryText), expiryText.hasSuffix("Z") else {
-            throw RuleParseError.invalidExpiry
-        }
-
-        let addressSource = try enclosed(lines[3], prefix: "        :addresses [", suffix: "]")
-        let emailAddress = try decodeQuoted(addressSource)
-        let handle = try decodeQuoted(
-            enclosed(lines[4], prefix: "        :handle ", suffix: "")
-        )
-        guard handle.hasPrefix("sievepilot-out-of-office-") else {
+    mutating func parse() throws -> ParsedOutOfOfficeConfiguration {
+        try expect("# BEGIN SIEVEPILOT RULE v1: out-of-office" + newline)
+        try expect("if currentdate :zone \"+0000\" :value \"lt\" \"iso8601\" ")
+        let expiryText = try parseQuoted()
+        try expect(" {" + newline)
+        try expect("    vacation" + newline)
+        try expect("        :addresses [")
+        let emailAddress = try parseQuoted()
+        try expect("]" + newline)
+        try expect("        :handle ")
+        let handle = try parseQuoted()
+        guard handle == "sievepilot-out-of-office-\(accountID.sieveToken)" else {
             throw RuleParseError.invalidHandle
         }
+        try expect(newline)
 
         let subject: String?
-        let messageLine: String
-        if lines.count == 9 {
-            subject = try decodeQuoted(
-                enclosed(lines[5], prefix: "        :subject ", suffix: "")
-            )
-            messageLine = lines[6]
+        if hasPrefix("        :subject ") {
+            try expect("        :subject ")
+            subject = try parseQuoted()
+            try expect(newline)
         } else {
             subject = nil
-            messageLine = lines[5]
         }
-        let message = try decodeQuoted(
-            enclosed(messageLine, prefix: "        ", suffix: ";")
-        )
 
+        try expect("        ")
+        let message = try parseQuoted()
+        try expect(";" + newline)
+        try expect("}" + newline)
+        try expect("# END SIEVEPILOT RULE v1: out-of-office" + newline)
+        guard cursor == source.endIndex else { throw RuleParseError.invalidRule }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        guard expiryText.hasSuffix("Z"), let expiry = formatter.date(from: expiryText) else {
+            throw RuleParseError.invalidExpiry
+        }
         return ParsedOutOfOfficeConfiguration(
             emailAddress: emailAddress,
             subject: subject,
@@ -113,43 +144,47 @@ public enum OutOfOfficeStateEvaluator {
         )
     }
 
-    private static func normalize(_ data: Data) -> String {
-        String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\r\n", with: "\n")
+    private mutating func expect(_ literal: String) throws {
+        guard source[cursor...].hasPrefix(literal) else { throw RuleParseError.invalidRule }
+        cursor = source.index(cursor, offsetBy: literal.count)
     }
 
-    private static func enclosed(_ value: String, prefix: String, suffix: String) throws -> String {
-        guard value.hasPrefix(prefix), value.hasSuffix(suffix) else {
-            throw RuleParseError.invalidRule
-        }
-        return String(value.dropFirst(prefix.count).dropLast(suffix.count))
+    private func hasPrefix(_ literal: String) -> Bool {
+        source[cursor...].hasPrefix(literal)
     }
 
-    private static func decodeQuoted(_ value: String) throws -> String {
-        guard value.first == "\"", value.last == "\"", value.count >= 2 else {
+    private mutating func parseQuoted() throws -> String {
+        guard cursor < source.endIndex, source[cursor] == "\"" else {
             throw RuleParseError.invalidString
         }
-        let characters = Array(value.dropFirst().dropLast())
+        cursor = source.index(after: cursor)
         var result = ""
-        var index = 0
-        while index < characters.count {
-            if characters[index] == "\\" {
-                index += 1
-                guard index < characters.count,
-                      characters[index] == "\\" || characters[index] == "\"" else {
+        while cursor < source.endIndex {
+            let character = source[cursor]
+            cursor = source.index(after: cursor)
+            if character == "\"" { return result }
+            if character == "\\" {
+                guard cursor < source.endIndex else { throw RuleParseError.invalidString }
+                let escaped = source[cursor]
+                cursor = source.index(after: cursor)
+                guard escaped == "\\" || escaped == "\"" else {
                     throw RuleParseError.invalidString
                 }
+                result.append(escaped)
+            } else {
+                guard character != "\0" else { throw RuleParseError.invalidString }
+                result.append(character)
             }
-            result.append(characters[index])
-            index += 1
         }
-        return result
+        throw RuleParseError.invalidString
     }
+}
 
-    private enum RuleParseError: Error {
-        case invalidRequirements
-        case invalidRule
-        case invalidExpiry
-        case invalidHandle
-        case invalidString
-    }
+private enum RuleParseError: Error {
+    case invalidUTF8
+    case invalidRequirements
+    case invalidRule
+    case invalidExpiry
+    case invalidHandle
+    case invalidString
 }

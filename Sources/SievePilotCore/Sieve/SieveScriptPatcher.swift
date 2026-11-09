@@ -24,35 +24,40 @@ public enum SieveScriptPatcher {
         let preamble = try SievePreambleScanner.scan(script)
         let sections = try ManagedSectionParser.parse(script, preamble: preamble)
         if let metadataRange = sections.metadata {
-            let existingAccountID = try accountIDToken(in: script[metadataRange])
-            guard existingAccountID == accountID.sieveToken else {
+            let existing: ManagedScriptMetadata
+            do {
+                existing = try ManagedScriptMetadataParser.parse(Data(script[metadataRange]))
+            } catch {
+                throw SieveScriptPatcherError.invalidManagedMetadata
+            }
+            guard existing.accountID == accountID else {
                 throw SieveScriptPatcherError.accountIDMismatch
             }
         }
 
-        let replacement: Data
-        switch mutation {
-        case let .enable(configuration):
-            let rendered = try ManagedSectionRenderer.renderOutOfOffice(
-                configuration: configuration,
+        var output = script
+        if let metadataRange = sections.metadata {
+            let operations = try replacements(
+                for: mutation,
+                metadata: metadata,
+                lineEnding: preamble.preferredLineEnding,
+                sections: sections,
+                metadataRange: metadataRange
+            )
+            for operation in operations.sorted(by: {
+                if $0.range.lowerBound == $1.range.lowerBound {
+                    return $0.range.upperBound > $1.range.upperBound
+                }
+                return $0.range.lowerBound > $1.range.lowerBound
+            }) {
+                output.replaceSubrange(operation.range, with: operation.data)
+            }
+        } else {
+            let replacement = try completeInsertion(
+                for: mutation,
                 metadata: metadata,
                 lineEnding: preamble.preferredLineEnding
             )
-            replacement = joined(rendered.metadata, rendered.requirements, rendered.rule)
-        case .disable:
-            replacement = ManagedSectionRenderer.renderMetadata(
-                metadata,
-                lineEnding: preamble.preferredLineEnding
-            )
-        }
-
-        var output = script
-        if let metadataRange = sections.metadata {
-            let end = sections.outOfOfficeRule?.upperBound
-                ?? sections.requirements?.upperBound
-                ?? metadataRange.upperBound
-            output.replaceSubrange(metadataRange.lowerBound..<end, with: replacement)
-        } else {
             let separator = leadingSeparator(
                 for: script,
                 insertionOffset: preamble.insertionOffset,
@@ -63,14 +68,65 @@ public enum SieveScriptPatcher {
         return output
     }
 
-    private static func accountIDToken(in metadata: Data.SubSequence) throws -> String {
-        let text = String(decoding: metadata, as: UTF8.self)
-        guard let line = text.split(whereSeparator: \Character.isNewline).first(where: {
-            $0.hasPrefix("# account-id: ")
-        }) else {
-            throw SieveScriptPatcherError.invalidManagedMetadata
+    private static func replacements(
+        for mutation: SieveScriptMutation,
+        metadata: ManagedScriptMetadata,
+        lineEnding: LineEnding,
+        sections: ManagedSections,
+        metadataRange: Range<Int>
+    ) throws -> [Replacement] {
+        let renderedMetadata = ManagedSectionRenderer.renderMetadata(
+            metadata,
+            lineEnding: lineEnding
+        )
+        switch mutation {
+        case let .enable(configuration):
+            let rendered = try ManagedSectionRenderer.renderOutOfOffice(
+                configuration: configuration,
+                metadata: metadata,
+                lineEnding: lineEnding
+            )
+            if let requirements = sections.requirements,
+               let rule = sections.outOfOfficeRule {
+                return [
+                    Replacement(range: metadataRange, data: rendered.metadata),
+                    Replacement(range: requirements, data: rendered.requirements),
+                    Replacement(range: rule, data: rendered.rule)
+                ]
+            }
+            return [
+                Replacement(range: metadataRange.upperBound..<metadataRange.upperBound,
+                            data: joined(rendered.requirements, rendered.rule)),
+                Replacement(range: metadataRange, data: rendered.metadata)
+            ]
+        case .disable:
+            var result = [Replacement(range: metadataRange, data: renderedMetadata)]
+            if let requirements = sections.requirements {
+                result.append(Replacement(range: requirements, data: Data()))
+            }
+            if let rule = sections.outOfOfficeRule {
+                result.append(Replacement(range: rule, data: Data()))
+            }
+            return result
         }
-        return String(line.dropFirst("# account-id: ".count))
+    }
+
+    private static func completeInsertion(
+        for mutation: SieveScriptMutation,
+        metadata: ManagedScriptMetadata,
+        lineEnding: LineEnding
+    ) throws -> Data {
+        switch mutation {
+        case let .enable(configuration):
+            let rendered = try ManagedSectionRenderer.renderOutOfOffice(
+                configuration: configuration,
+                metadata: metadata,
+                lineEnding: lineEnding
+            )
+            return joined(rendered.metadata, rendered.requirements, rendered.rule)
+        case .disable:
+            return ManagedSectionRenderer.renderMetadata(metadata, lineEnding: lineEnding)
+        }
     }
 
     private static func leadingSeparator(
@@ -86,5 +142,10 @@ public enum SieveScriptPatcher {
 
     private static func joined(_ parts: Data...) -> Data {
         parts.reduce(into: Data()) { $0.append($1) }
+    }
+
+    private struct Replacement {
+        let range: Range<Int>
+        let data: Data
     }
 }

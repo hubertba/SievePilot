@@ -9,12 +9,15 @@ import Testing
         #expect(encoded == Data("\"a\\\"b\\\\c\"".utf8))
     }
 
-    @Test func testRejectsNULAndNewlineInQuotedString() {
+    @Test func testRejectsNULInQuotedString() {
         #expect(throws: SieveStringEncodingError.unsupportedControlCharacter) {
             try SieveStringEncoder.encodeQuoted("before\0after")
         }
-        #expect(throws: SieveStringEncodingError.unsupportedControlCharacter) {
-            try SieveStringEncoder.encodeQuoted("before\nafter")
-        }
+    }
+
+    @Test func testMessageQuotedStringPreservesLineBreaks() throws {
+        let encoded = try SieveStringEncoder.encodeMessageQuoted("before\nafter\r\n")
+
+        #expect(encoded == Data("\"before\nafter\r\n\"".utf8))
     }
 }
