@@ -48,6 +48,8 @@ validate_project() {
   require_text "$project" 'productName = SievePilotCore;'
   require_text "$project" 'SievePilotCore in Frameworks'
   require_text "$project" 'MACOSX_DEPLOYMENT_TARGET = 13.0;'
+  require_text "$project" 'ONLY_ACTIVE_ARCH = YES;'
+  require_text "$project" 'ENABLE_TESTABILITY = YES;'
   require_text "$project" 'GENERATE_INFOPLIST_FILE = YES;'
   require_text "$project" 'INFOPLIST_KEY_LSUIElement = YES;'
   require_text "$project" 'PRODUCT_BUNDLE_IDENTIFIER = com.hubertba.SievePilot;'
@@ -57,8 +59,21 @@ validate_project() {
   echo 'Validated SievePilot Xcode project'
 }
 
+validate_documentation() {
+  require_text README.md 'open SievePilot.xcodeproj'
+  require_text README.md 'swift test'
+  require_text README.md "xcodebuild test -project SievePilot.xcodeproj -scheme SievePilot -destination 'platform=macOS'"
+  require_text .gitignore 'xcuserdata/'
+  require_text .gitignore 'DerivedData/'
+  echo 'Validated SievePilot developer documentation'
+}
+
 case "$mode" in
   sources) validate_sources ;;
   project) validate_project ;;
+  all)
+    validate_project
+    validate_documentation
+    ;;
   *) fail "unsupported validation mode: $mode" ;;
 esac
