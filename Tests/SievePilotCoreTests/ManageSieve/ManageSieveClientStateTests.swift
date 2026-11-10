@@ -67,6 +67,20 @@ import Testing
         #expect(await transport.assertComplete())
     }
 
+    @Test func startTLSRejectsUnexpectedDataBeforeTLSUpgrade() async {
+        let transport = FakeManageSieveTransport([
+            .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
+            .read(Data("123\r\nOK\r\n".utf8)),
+        ])
+        let client = makeClient(transport)
+        await expectError(.parse) { try await client.connectAndStartTLS(identity: identity) }
+        #expect(await client.state == .closed)
+        #expect(await transport.closeCount == 1)
+        #expect(await transport.upgradeCount == 0)
+        #expect(await transport.writes == [Data("STARTTLS\r\n".utf8)])
+        #expect(await transport.assertComplete())
+    }
+
     @Test func failedTLSUpgradeClosesExactlyOnce() async {
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
@@ -187,6 +201,31 @@ import Testing
         #expect(await transport.closeCount == 1)
     }
 
+    @Test func suspendedConnectTimesOutWithoutWaitingForOperationCancellation() async {
+        let transport = FakeManageSieveTransport([.suspendConnect])
+        let client = ManageSieveClient(
+            transport: transport, clock: ImmediateManageSieveClock(),
+            timeoutPolicy: ManageSieveTimeoutPolicy(connect: .seconds(1), startTLS: .seconds(1), authentication: .seconds(1), command: .seconds(1)),
+            limits: .production, logger: FakeManageSieveLogger()
+        )
+        let completion = TimeoutCompletion()
+        let pending = Task {
+            do { _ = try await client.connectAndStartTLS(identity: identity); await completion.complete(nil) }
+            catch { await completion.complete(error as? ManageSieveClientError) }
+        }
+        while !(await transport.isConnectSuspended) { await Task.yield() }
+        try? await Task.sleep(for: .milliseconds(150))
+        let delivered = await completion.didComplete
+        #expect(delivered, "Timeout must return even when connect ignores cancellation")
+        #expect(await client.state == .closed)
+        #expect(await transport.closeCount == 1)
+        #expect(await transport.writes.isEmpty)
+        if !delivered { await transport.resumeConnect() } // Unblock the pre-fix implementation.
+        await pending.value
+        #expect(await completion.error == .timeout)
+        #expect(await transport.assertComplete())
+    }
+
     @Test func invalidIdentityAndIllegalOperationsSendNoBytes() async throws {
         let transport = FakeManageSieveTransport([])
         let client = makeClient(transport)
@@ -221,5 +260,15 @@ import Testing
             timeoutPolicy: ManageSieveTimeoutPolicy(connect: .seconds(5), startTLS: .seconds(5), authentication: .seconds(5), command: .seconds(5)),
             limits: limits, logger: FakeManageSieveLogger()
         )
+    }
+}
+
+private actor TimeoutCompletion {
+    private(set) var didComplete = false
+    private(set) var error: ManageSieveClientError?
+
+    func complete(_ error: ManageSieveClientError?) {
+        self.error = error
+        didComplete = true
     }
 }

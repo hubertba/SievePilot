@@ -5,6 +5,7 @@ public protocol ManageSieveTransport: AnyObject, Sendable {
     func read(maxBytes: Int) async throws -> Data
     func write(_ data: Data) async throws
     func upgradeToTLS(identity: ManageSieveTLSIdentityRequest) async throws
+    // Closing must release any pending transport operations, even if they ignore task cancellation.
     func close() async
 }
 

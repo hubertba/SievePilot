@@ -112,6 +112,7 @@ public actor ManageSieveClient {
         try await send("STARTTLS\r\n")
         let response = try await readResponse()
         try requireOK(response)
+        guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
         do { try await transport.upgradeToTLS(identity: identity) } catch {
             throw ManageSieveClientError.tls
         }
@@ -198,6 +199,19 @@ public actor ManageSieveClient {
         admittedOperation = false
     }
 
+    private func closeOnTimeout() {
+        guard state != .closed else { return }
+        state = .closed
+        capabilities = nil
+        let transport = self.transport
+        let logger = self.logger
+        // Start closure before reporting the timeout; never wait for a stalled transport operation.
+        Task {
+            await transport.close()
+            logger.record(.closed)
+        }
+    }
+
     private func sanitized(_ error: Error) -> ManageSieveClientError {
         if let clientError = error as? ManageSieveClientError { return clientError }
         if error is CancellationError { return .timeout }
@@ -208,15 +222,34 @@ public actor ManageSieveClient {
         _ duration: Duration,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask { [clock] in
-                try await clock.sleep(for: duration)
-                throw ManageSieveClientError.timeout
+        let gate = ManageSieveTimeoutGate()
+        let operationTask = Task { try await operation() }
+        return try await withCheckedThrowingContinuation { continuation in
+            let timeoutTask = Task { [clock] in
+                do { try await clock.sleep(for: duration) } catch {
+                    if Task.isCancelled { return }
+                }
+                guard !Task.isCancelled, await gate.claim() else { return }
+                closeOnTimeout()
+                operationTask.cancel()
+                continuation.resume(throwing: ManageSieveClientError.timeout)
             }
-            defer { group.cancelAll() }
-            guard let result = try await group.next() else { throw ManageSieveClientError.timeout }
-            return result
+            Task {
+                let result = await operationTask.result
+                guard await gate.claim() else { return }
+                timeoutTask.cancel()
+                continuation.resume(with: result)
+            }
         }
+    }
+}
+
+private actor ManageSieveTimeoutGate {
+    private var claimed = false
+
+    func claim() -> Bool {
+        guard !claimed else { return false }
+        claimed = true
+        return true
     }
 }

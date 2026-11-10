@@ -69,7 +69,11 @@ actor FakeManageSieveTransport: ManageSieveTransport {
         }
     }
 
-    func close() { closeCount += 1 }
+    func close() {
+        closeCount += 1
+        // A real transport must release pending connect/read/write/upgrade operations on close.
+        resumeConnect()
+    }
 
     func assertComplete() -> Bool { steps.isEmpty && violations.isEmpty }
 
