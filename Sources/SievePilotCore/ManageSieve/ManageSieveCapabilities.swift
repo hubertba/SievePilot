@@ -47,6 +47,10 @@ public struct ManageSieveCapabilities: Equatable, Sendable {
         response: ManageSieveCommandResponse,
         origin: ManageSieveCapabilityOrigin
     ) throws {
+        guard response.status.status == .ok else {
+            throw ManageSieveInterpretationError.capabilityResponseRejected(response.status.status)
+        }
+
         var entries: [ManageSieveCapability] = []
         var singletonNames: Set<Data> = []
 

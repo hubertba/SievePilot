@@ -10,6 +10,7 @@ public enum ManageSieveInterpretationError: Error, Equatable, Sendable {
     case malformedStatus
     case missingTerminalStatus
     case multipleTerminalStatuses
+    case capabilityResponseRejected(ManageSieveStatus)
     case malformedCapability
     case duplicateSingletonCapability(String)
     case missingAuthoritativeCapability(String)

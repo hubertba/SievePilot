@@ -172,6 +172,18 @@ import Testing
         }
     }
 
+    @Test(arguments: [ManageSieveStatus.no, .bye])
+    func nonOKCapabilityResponsesAreRejected(status: ManageSieveStatus) {
+        #expect(throws: ManageSieveInterpretationError.capabilityResponseRejected(status)) {
+            try parseCapabilities([
+                strings("IMPLEMENTATION", "server"),
+                strings("VERSION", "1"),
+                strings("SASL", "PLAIN"),
+                strings("SIEVE", "fileinto"),
+            ], terminalStatus: status)
+        }
+    }
+
     @Test func completePostTLSCapabilitiesAreAuthoritative() throws {
         let capabilities = try parseCapabilities([
             strings("IMPLEMENTATION", "server"),
@@ -186,15 +198,26 @@ import Testing
 
     private func parseCapabilities(
         _ dataLines: [ManageSieveWireLine],
-        origin: ManageSieveCapabilityOrigin = .postTLSCapability
+        origin: ManageSieveCapabilityOrigin = .postTLSCapability,
+        terminalStatus: ManageSieveStatus = .ok
     ) throws -> ManageSieveCapabilities {
         let response = try ManageSieveCommandResponse(
-            lines: dataLines + [ManageSieveWireLine(tokens: [.atom("OK")])]
+            lines: dataLines + [ManageSieveWireLine(tokens: [.atom(terminalStatus.keyword)])]
         )
         return try ManageSieveCapabilities(response: response, origin: origin)
     }
 
     private func strings(_ values: String...) -> ManageSieveWireLine {
         ManageSieveWireLine(tokens: values.map { .string(Data($0.utf8)) })
+    }
+}
+
+private extension ManageSieveStatus {
+    var keyword: String {
+        switch self {
+        case .ok: "OK"
+        case .no: "NO"
+        case .bye: "BYE"
+        }
     }
 }
