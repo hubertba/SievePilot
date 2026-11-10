@@ -83,6 +83,17 @@ import Testing
         #expect(await transport.assertComplete())
     }
 
+    @Test func plainNoWithDataLineClosesAndClearsCapabilities() async throws {
+        let (transport, client) = setup([
+            .write(plainCommand(username, password)), .read(Data("\"!!!!\"\r\nNO\r\n".utf8)),
+        ])
+        _ = try await client.connectAndStartTLS(identity: identity)
+        await expectError(.parse) { try await client.authenticatePlain(username: username, password: password) }
+        #expect(await client.state == .closed)
+        #expect(await client.capabilities == nil)
+        #expect(await transport.assertComplete())
+    }
+
     @Test func plainPermitsUnicode() async throws {
         let (transport, client) = setup([.write(plainCommand("é🐈", "🔑é")), .read(Data("NO\r\n".utf8))])
         _ = try await client.connectAndStartTLS(identity: identity)
@@ -112,6 +123,29 @@ import Testing
         _ = try await client.connectAndStartTLS(identity: identity)
         await expectError(.parse) { try await client.authenticateLogin(username: username, password: password) }
         #expect(await client.state == .closed)
+        #expect(await transport.assertComplete())
+    }
+
+    @Test(arguments: ["NO\r\nBYE\r\n", "NO\r\n\""])
+    func loginEarlyNoWithTrailingInputCloses(wire: String) async throws {
+        let (transport, client) = setup([
+            .write(Data("AUTHENTICATE \"LOGIN\"\r\n".utf8)), .read(Data(wire.utf8)),
+        ])
+        _ = try await client.connectAndStartTLS(identity: identity)
+        await expectError(.parse) { try await client.authenticateLogin(username: username, password: password) }
+        #expect(await client.state == .closed)
+        #expect(await client.capabilities == nil)
+        #expect(await transport.assertComplete())
+    }
+
+    @Test func loginStandaloneEarlyNoRetainsEncryptedReady() async throws {
+        let (transport, client) = setup([
+            .write(Data("AUTHENTICATE \"LOGIN\"\r\n".utf8)), .read(Data("NO\r\n".utf8)),
+        ])
+        let initial = try await client.connectAndStartTLS(identity: identity)
+        await expectError(.serverNo) { try await client.authenticateLogin(username: username, password: password) }
+        #expect(await client.state == .encryptedReady)
+        #expect(await client.capabilities == initial)
         #expect(await transport.assertComplete())
     }
 
@@ -180,7 +214,7 @@ import Testing
         let pending = Task { try await client.authenticatePlain(username: username, password: password, timeout: .seconds(1)) }
         while !(await transport.slowReadStarted) { await Task.yield() }
         await expectError(.invalidState) { try await client.authenticateLogin(username: username, password: password) }
-        await expectError(.invalidState) { try await client.capability(); return }
+        await expectError(.invalidState) { _ = try await client.capability() }
         await expectError(.invalidState) { try await client.authenticatePlain(username: username, password: password) }
         pending.cancel()
         await expectError(.transport) { try await pending.value }

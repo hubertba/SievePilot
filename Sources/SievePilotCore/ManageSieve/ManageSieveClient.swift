@@ -111,8 +111,8 @@ public actor ManageSieveClient {
                 defer { ManageSieveAuthentication.wipe(&command) }
                 try await self.sendBytes(command)
                 let response = try await self.readResponse()
-                try self.requireOK(response)
                 guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
+                try self.requireOK(response)
             }
             accepted = true
             try await finishAuthentication(timeout: timeout)
@@ -143,6 +143,11 @@ public actor ManageSieveClient {
                 var pending: [ManageSieveWireLine] = []
                 for value in [username, password] {
                     let line = try await self.readAuthenticationLine(parser: &parser, pending: &pending)
+                    if case let .atom(word)? = line.tokens.first,
+                       ["OK", "NO", "BYE"].contains(word.uppercased()) {
+                        guard pending.isEmpty else { throw ManageSieveClientError.parse }
+                        do { try parser.finish() } catch { throw ManageSieveClientError.parse }
+                    }
                     try self.requireChallenge(line)
                     if pending.contains(where: { line in
                         if case let .atom(word)? = line.tokens.first {
