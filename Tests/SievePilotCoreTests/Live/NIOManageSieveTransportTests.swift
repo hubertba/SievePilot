@@ -139,6 +139,103 @@ final class NIOManageSieveTransportTests: XCTestCase {
         await shutdown(group)
     }
 
+    func testOwnedGroupCloseDuringAdmittedConnectWaitsForSubmission() async throws {
+        let serverGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let listener = try server(group: serverGroup, recorder: ServerRecorder())
+        let admitted = expectation(description: "connect admitted before submission")
+        let closed = expectation(description: "connect waiter released by close")
+        let gate = DispatchSemaphore(value: 0)
+        let signalLock = NSLock()
+        var submissionReleased = false
+        let transport = NIOManageSieveTransport(
+            endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!),
+            eventLoopGroup: nil,
+            submissionHook: {
+                admitted.fulfill(); gate.wait()
+                signalLock.lock(); submissionReleased = true; signalLock.unlock()
+            },
+            closeHook: { closed.fulfill() },
+            shutdownHook: {
+                signalLock.lock(); defer { signalLock.unlock() }
+                XCTAssertTrue(submissionReleased, "owned group shut down before admitted connect submission")
+            }
+        )
+        let pending = Task { try await transport.connect() }
+        await fulfillment(of: [admitted], timeout: 3)
+        let closing = Task { await transport.close() }
+        await fulfillment(of: [closed], timeout: 3)
+        do { _ = try await transport.read(maxBytes: 1); XCTFail("Expected closed state") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .closed) }
+        gate.signal()
+        do { try await pending.value; XCTFail("Expected close to release connect") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .closed) }
+        await closing.value
+        try await listener.close().get()
+        await shutdown(serverGroup)
+    }
+
+    func testOwnedGroupCloseDuringAdmittedWriteWaitsForSubmission() async throws {
+        let serverGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let listener = try server(group: serverGroup, recorder: ServerRecorder())
+        let admitted = expectation(description: "write admitted before submission")
+        let closed = expectation(description: "write waiter released by close")
+        let gate = DispatchSemaphore(value: 0)
+        let submissionLock = NSLock()
+        var submissionCount = 0
+        var submissionReleased = false
+        let transport = NIOManageSieveTransport(
+            endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!),
+            eventLoopGroup: nil,
+            submissionHook: {
+                submissionLock.lock(); submissionCount += 1
+                let isWrite = submissionCount == 2
+                submissionLock.unlock()
+                if isWrite {
+                    admitted.fulfill(); gate.wait()
+                    submissionLock.lock(); submissionReleased = true; submissionLock.unlock()
+                }
+            },
+            closeHook: { closed.fulfill() },
+            shutdownHook: {
+                submissionLock.lock(); defer { submissionLock.unlock() }
+                XCTAssertTrue(submissionReleased, "owned group shut down before admitted write submission")
+            }
+        )
+        try await transport.connect()
+        let writing = Task { try await transport.write(Data("secret".utf8)) }
+        await fulfillment(of: [admitted], timeout: 3)
+        let closing = Task { await transport.close() }
+        await fulfillment(of: [closed], timeout: 3)
+        do { _ = try await transport.read(maxBytes: 1); XCTFail("Expected closed state") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .closed) }
+        gate.signal()
+        do { try await writing.value; XCTFail("Expected close to release write") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .closed) }
+        await closing.value
+        try await listener.close().get()
+        await shutdown(serverGroup)
+    }
+
+    func testFloodWithoutReaderClosesWithSanitizedOverflow() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let recorder = ServerRecorder()
+        let listener = try server(group: group, recorder: recorder)
+        let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group)
+        try await transport.connect()
+        await waitUntil { recorder.channel != nil }
+        let peer = try XCTUnwrap(recorder.channel)
+        try? await peer.writeAndFlush(ByteBuffer(bytes: Array(repeating: UInt8(0x5a), count: 128 * 1024))).get()
+        await waitUntil { !peer.isActive }
+        do { _ = try await transport.read(maxBytes: 1); XCTFail("Expected overflow") }
+        catch {
+            XCTAssertEqual(error as? NIOTransportError, .inboundOverflow)
+            XCTAssertFalse(String(describing: error).contains("ZZZZ"))
+        }
+        await transport.close()
+        try await listener.close().get()
+        await shutdown(group)
+    }
+
     func testTLSIsUnsupportedAndCannotEnableAuthentication() async throws {
         let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: 4190))
         do {

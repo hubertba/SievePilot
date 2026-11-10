@@ -23,7 +23,14 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     private let endpoint: Endpoint
     private let group: any EventLoopGroup
     private let ownsGroup: Bool
+    private let submissionHook: (() -> Void)?
+    private let closeHook: (() -> Void)?
+    private let shutdownHook: (() -> Void)?
     private let lock = NSLock()
+    private var activeSubmissions = 0
+    private var submissionWaiter: CheckedContinuation<Void, Never>?
+    private var terminalError: NIOTransportError?
+    private static let maximumBufferedInboundBytes = 64 * 1024
     private var lifecycle: Lifecycle = .disconnected
     private var connectWaiter: CheckedContinuation<Void, Error>?
     private var readWaiters: [(Int, CheckedContinuation<Data, Error>)] = []
@@ -31,10 +38,18 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     private var received = Data()
     private var eof = false
 
-    public init(endpoint: Endpoint, eventLoopGroup: (any EventLoopGroup)? = nil) {
+    public convenience init(endpoint: Endpoint, eventLoopGroup: (any EventLoopGroup)? = nil) {
+        self.init(endpoint: endpoint, eventLoopGroup: eventLoopGroup, submissionHook: nil, closeHook: nil, shutdownHook: nil)
+    }
+
+    // The hook exposes admission to deterministic loopback race tests; production never supplies it.
+    internal init(endpoint: Endpoint, eventLoopGroup: (any EventLoopGroup)?, submissionHook: (() -> Void)?, closeHook: (() -> Void)? = nil, shutdownHook: (() -> Void)? = nil) {
         self.endpoint = endpoint
         self.ownsGroup = eventLoopGroup == nil
         self.group = eventLoopGroup ?? MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        self.submissionHook = submissionHook
+        self.closeHook = closeHook
+        self.shutdownHook = shutdownHook
     }
 
     public func connect() async throws {
@@ -47,8 +62,11 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
             }
             lifecycle = .connecting
             connectWaiter = continuation
+            activeSubmissions += 1
             lock.unlock()
 
+            submissionHook?()
+            defer { finishSubmission() }
             let bootstrap = ClientBootstrap(group: group)
                 .channelInitializer { channel in channel.pipeline.addHandler(InboundHandler(owner: self)) }
             let future: EventLoopFuture<Channel> = bootstrap.connect(host: endpoint.host, port: endpoint.port)
@@ -86,8 +104,8 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
                 continuation.resume(throwing: NIOTransportError.invalidReadSize)
                 return
             }
-            guard case .connected = lifecycle else {
-                let error: NIOTransportError = isClosed ? .closed : .invalidState
+            guard terminalError == nil, case .connected = lifecycle else {
+                let error: NIOTransportError = terminalError ?? (isClosed ? .closed : .invalidState)
                 lock.unlock()
                 continuation.resume(throwing: error)
                 return
@@ -115,15 +133,18 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     public func write(_ data: Data) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             lock.lock()
-            guard case .connected(let channel) = lifecycle else {
-                let error: NIOTransportError = isClosed ? .closed : .invalidState
+            guard terminalError == nil, case .connected(let channel) = lifecycle else {
+                let error: NIOTransportError = terminalError ?? (isClosed ? .closed : .invalidState)
                 lock.unlock()
                 continuation.resume(throwing: error)
                 return
             }
             let id = UUID()
             writeWaiters[id] = continuation
+            activeSubmissions += 1
             lock.unlock()
+            submissionHook?()
+            defer { finishSubmission() }
             var buffer = channel.allocator.buffer(capacity: data.count)
             buffer.writeBytes(data)
             let future: EventLoopFuture<Void> = channel.writeAndFlush(buffer)
@@ -139,14 +160,38 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
         }
     }
 
+    private func finishSubmission() {
+        lock.lock()
+        activeSubmissions -= 1
+        let waiter = activeSubmissions == 0 ? submissionWaiter : nil
+        if waiter != nil { submissionWaiter = nil }
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    private func awaitSubmissions() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if activeSubmissions == 0 {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                submissionWaiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+
     public func upgradeToTLS(identity: ManageSieveTLSIdentityRequest) async throws {
         throw NIOTransportError.tlsUnsupported
     }
 
     public func close() async {
         guard let channel = beginClose() else { return }
+        await awaitSubmissions()
         if let channel { _ = try? await channel.close().get() }
         if ownsGroup {
+            shutdownHook?()
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 group.shutdownGracefully { _ in continuation.resume() }
             }
@@ -167,9 +212,11 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
         let writes = Array(writeWaiters.values)
         writeWaiters.removeAll()
         lock.unlock()
-        connect?.resume(throwing: NIOTransportError.closed)
-        for (_, waiter) in reads { waiter.resume(throwing: NIOTransportError.closed) }
-        for waiter in writes { waiter.resume(throwing: NIOTransportError.closed) }
+        let failure = terminalError ?? .closed
+        connect?.resume(throwing: failure)
+        for (_, waiter) in reads { waiter.resume(throwing: failure) }
+        for waiter in writes { waiter.resume(throwing: failure) }
+        closeHook?()
         return .some(channel)
     }
 
@@ -181,14 +228,22 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     private func receive(_ data: Data) {
         lock.lock()
         guard !isClosed else { lock.unlock(); return }
+        guard terminalError == nil else { lock.unlock(); return }
         received.append(data)
         let ready = drainReads()
+        let overflow = received.count > Self.maximumBufferedInboundBytes
+        if overflow {
+            terminalError = .inboundOverflow
+            received.removeAll()
+        }
         lock.unlock()
         for (waiter, data) in ready { waiter.resume(returning: data) }
+        if overflow { Task { await self.close() } }
     }
 
     private func endOfStream() {
         lock.lock()
+        guard terminalError == nil else { lock.unlock(); return }
         eof = true
         let ready = drainReads()
         lock.unlock()
