@@ -196,6 +196,25 @@ import Testing
         #expect(capabilities.isAuthoritative)
     }
 
+    @Test(arguments: ["IMPLEMENTATION", "VERSION", "SASL", "SIEVE", "OWNER", "LANGUAGE", "NOTIFY"])
+    func recognizedValuedCapabilitiesRequireAStringButAllowEmpty(name: String) throws {
+        #expect(throws: ManageSieveInterpretationError.malformedCapability) {
+            try parseCapabilities([strings(name.lowercased())], origin: .preTLSGreeting)
+        }
+        let capabilities = try parseCapabilities([strings(name, "")], origin: .preTLSGreeting)
+        #expect(capabilities.entries.first?.value == Data())
+    }
+
+    @Test func startTLSMustBeValuelessAndUnknownArityRemainsGeneric() throws {
+        #expect(throws: ManageSieveInterpretationError.malformedCapability) {
+            try parseCapabilities([strings("starttls", "")], origin: .preTLSGreeting)
+        }
+        let capabilities = try parseCapabilities([strings("X-ONE"), strings("X-TWO", "")], origin: .preTLSGreeting)
+        #expect(capabilities.unknownCapabilities.count == 2)
+        #expect(capabilities.entries[0].value == nil)
+        #expect(capabilities.entries[1].value == Data())
+    }
+
     private func parseCapabilities(
         _ dataLines: [ManageSieveWireLine],
         origin: ManageSieveCapabilityOrigin = .postTLSCapability,

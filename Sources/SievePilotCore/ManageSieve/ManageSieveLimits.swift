@@ -1,6 +1,8 @@
 public struct ManageSieveLimits: Equatable, Sendable {
     public static let production = ManageSieveLimits()
 
+    /// Maximum logical-line non-literal syntax bytes, excluding CRLF delimiters and literal bodies.
+    /// Literal headers count toward this limit; aggregate response accounting includes all framing.
     public let maximumLineLength: Int
     public let maximumLiteralLength: Int
     public let maximumAggregateResponseLength: Int

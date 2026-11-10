@@ -20,6 +20,7 @@ public enum ManageSieveParserError: Error, Equatable, Sendable {
     case bareLineFeed
     case incompleteInput
     case invalidLiteralLength
+    case quotedStringTooLong
     case lineTooLong
     case malformedEscape
     case malformedSyntax

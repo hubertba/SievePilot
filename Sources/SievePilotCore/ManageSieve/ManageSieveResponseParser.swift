@@ -3,6 +3,9 @@ import Foundation
 public struct ManageSieveResponseParser: Sendable {
     private let limits: ManageSieveLimits
     private var buffer: [UInt8] = []
+    var bufferedByteCount: Int { buffer.count }
+    var retainedBufferCapacity: Int { buffer.capacity }
+    private(set) var peakBufferedByteCount = 0
     private var aggregateByteCount = 0
     private var completedDataLineCount = 0
     private var failure: ManageSieveParserError?
@@ -13,57 +16,62 @@ public struct ManageSieveResponseParser: Sendable {
 
     public mutating func feed(_ data: Data) throws -> [ManageSieveWireLine] {
         if let failure { throw failure }
-        buffer.append(contentsOf: data)
 
         do {
             var lines: [ManageSieveWireLine] = []
-            while true {
-                var lineParser = LineParser(
-                    bytes: buffer,
-                    maximumLineLength: limits.maximumLineLength,
-                    maximumLiteralLength: limits.maximumLiteralLength
-                )
-                guard let parsed = try lineParser.parse() else { break }
-                let nextAggregateByteCount = try checkedSum(
-                    aggregateByteCount,
-                    parsed.consumedByteCount,
-                    error: .aggregateResponseTooLong
-                )
-                guard nextAggregateByteCount <= limits.maximumAggregateResponseLength else {
-                    throw ManageSieveParserError.aggregateResponseTooLong
-                }
-
-                if parsed.line.isTerminalStatus {
-                    aggregateByteCount = 0
-                    completedDataLineCount = 0
-                } else {
-                    let nextLineCount = try checkedSum(
-                        completedDataLineCount,
-                        1,
-                        error: .tooManyLines
-                    )
-                    guard nextLineCount <= limits.maximumLineCount else {
-                        throw ManageSieveParserError.tooManyLines
+            var inputIndex = data.startIndex
+            repeat {
+                if inputIndex < data.endIndex {
+                    let available = limits.maximumAggregateResponseLength - aggregateByteCount - buffer.count
+                    guard available > 0 else {
+                        throw ManageSieveParserError.aggregateResponseTooLong
                     }
-                    aggregateByteCount = nextAggregateByteCount
-                    completedDataLineCount = nextLineCount
+                    let spanLength = min(4096, available, data.distance(from: inputIndex, to: data.endIndex))
+                    let endIndex = data.index(inputIndex, offsetBy: spanLength)
+                    buffer.append(contentsOf: data[inputIndex..<endIndex])
+                    peakBufferedByteCount = max(peakBufferedByteCount, buffer.count)
+                    inputIndex = endIndex
                 }
+                while true {
+                    var lineParser = LineParser(
+                        bytes: buffer,
+                        maximumLineLength: limits.maximumLineLength,
+                        maximumLiteralLength: limits.maximumLiteralLength
+                    )
+                    guard let parsed = try lineParser.parse() else { break }
+                    let nextAggregateByteCount = try checkedSum(
+                        aggregateByteCount,
+                        parsed.consumedByteCount,
+                        error: .aggregateResponseTooLong
+                    )
+                    guard nextAggregateByteCount <= limits.maximumAggregateResponseLength else {
+                        throw ManageSieveParserError.aggregateResponseTooLong
+                    }
 
-                buffer.removeFirst(parsed.consumedByteCount)
-                lines.append(parsed.line)
-            }
+                    if parsed.line.isTerminalStatus {
+                        aggregateByteCount = 0
+                        completedDataLineCount = 0
+                    } else {
+                        let nextLineCount = try checkedSum(
+                            completedDataLineCount,
+                            1,
+                            error: .tooManyLines
+                        )
+                        guard nextLineCount <= limits.maximumLineCount else {
+                            throw ManageSieveParserError.tooManyLines
+                        }
+                        aggregateByteCount = nextAggregateByteCount
+                        completedDataLineCount = nextLineCount
+                    }
 
-            let bufferedAggregateByteCount = try checkedSum(
-                aggregateByteCount,
-                buffer.count,
-                error: .aggregateResponseTooLong
-            )
-            guard bufferedAggregateByteCount <= limits.maximumAggregateResponseLength else {
-                throw ManageSieveParserError.aggregateResponseTooLong
-            }
+                    buffer.removeFirst(parsed.consumedByteCount)
+                    lines.append(parsed.line)
+                }
+            } while inputIndex < data.endIndex
             return lines
         } catch let error as ManageSieveParserError {
             failure = error
+            buffer = []
             throw error
         }
     }
@@ -72,6 +80,7 @@ public struct ManageSieveResponseParser: Sendable {
         if let failure { throw failure }
         guard buffer.isEmpty, aggregateByteCount == 0, completedDataLineCount == 0 else {
             failure = .incompleteInput
+            buffer = []
             throw ManageSieveParserError.incompleteInput
         }
     }
@@ -152,10 +161,14 @@ private struct LineParser {
     }
 
     private mutating func parseQuotedString() throws -> ManageSieveToken {
+        let start = cursor
         try consumeSyntaxByte()
         var value: [UInt8] = []
 
         while true {
+            guard cursor - start < 1024 else {
+                throw ManageSieveParserError.quotedStringTooLong
+            }
             guard cursor < bytes.count else { throw IncompleteParse() }
             switch bytes[cursor] {
             case 0x22:
@@ -164,6 +177,9 @@ private struct LineParser {
             case 0x5c:
                 try consumeSyntaxByte()
                 guard cursor < bytes.count else { throw IncompleteParse() }
+                guard cursor - start < 1024 else {
+                    throw ManageSieveParserError.quotedStringTooLong
+                }
                 let escaped = bytes[cursor]
                 guard escaped == 0x22 || escaped == 0x5c else {
                     throw ManageSieveParserError.malformedEscape

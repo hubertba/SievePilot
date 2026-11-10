@@ -73,6 +73,10 @@ public struct ManageSieveCapabilities: Equatable, Sendable {
             let capability = ManageSieveCapability(name: name, value: value)
 
             let foldedName = Self.foldedASCII(capability.name)
+            guard (!Self.valuedCapabilityNames.contains(foldedName) || value != nil),
+                  (foldedName != Data("STARTTLS".utf8) || value == nil) else {
+                throw ManageSieveInterpretationError.malformedCapability
+            }
             if Self.singletonCapabilityNames.contains(foldedName),
                !singletonNames.insert(foldedName).inserted {
                 throw ManageSieveInterpretationError.duplicateSingletonCapability(
@@ -166,8 +170,9 @@ public struct ManageSieveCapabilities: Equatable, Sendable {
         Data("LANGUAGE".utf8),
     ]
 
-    private static let knownCapabilityNames: Set<Data> = [
-        Data("STARTTLS".utf8),
+    private static let knownCapabilityNames = valuedCapabilityNames.union([Data("STARTTLS".utf8)])
+
+    private static let valuedCapabilityNames: Set<Data> = [
         Data("SASL".utf8),
         Data("SIEVE".utf8),
         Data("IMPLEMENTATION".utf8),

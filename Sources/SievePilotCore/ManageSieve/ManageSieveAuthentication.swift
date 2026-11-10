@@ -18,9 +18,17 @@ enum ManageSieveAuthentication {
         return raw.base64EncodedData()
     }
 
-    static func quoted(_ value: Data) -> Data {
+    static func string(_ value: Data) -> Data {
         var result = Data([0x22])
         for byte in value {
+            let encodedByteCount = (byte == 0x22 || byte == 0x5c) ? 2 : 1
+            // Reserve the closing quote within the RFC 2244 1024-octet wire bound.
+            guard result.count + encodedByteCount + 1 <= 1024 else {
+                wipe(&result)
+                var literal = Data("{\(value.count)+}\r\n".utf8)
+                literal.append(value)
+                return literal
+            }
             if byte == 0x22 || byte == 0x5c { result.append(0x5c) }
             result.append(byte)
         }

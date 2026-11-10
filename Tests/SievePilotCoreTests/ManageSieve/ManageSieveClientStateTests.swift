@@ -110,6 +110,28 @@ import Testing
         #expect(await transport.assertComplete())
     }
 
+    @Test(arguments: ["IMPLEMENTATION", "VERSION", "SASL", "SIEVE", "OWNER", "LANGUAGE", "NOTIFY", "STARTTLS"])
+    func malformedRecognizedPostTLSCapabilityCloses(name: String) async {
+        let wire: String
+        if ["IMPLEMENTATION", "VERSION", "SASL", "SIEVE"].contains(name) {
+            wire = postTLS.components(separatedBy: "\r\n").map { $0.hasPrefix("\"" + name + "\"") ? "\"" + name + "\"" : $0 }.joined(separator: "\r\n")
+        } else {
+            wire = "\"" + name + "\"" + (name == "STARTTLS" ? " \"\"" : "") + "\r\n" + postTLS
+        }
+        let transport = FakeManageSieveTransport([
+            .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
+            .read(Data("OK\r\n".utf8)), .upgrade(identity),
+            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(wire.utf8)),
+        ])
+        let client = makeClient(transport)
+        await expectError(.parse) { try await client.connectAndStartTLS(identity: identity) }
+        #expect(await client.state == .closed)
+        #expect(await client.capabilities == nil)
+        #expect(await transport.closeCount == 1)
+        #expect(await transport.assertComplete())
+    }
+
+
     @Test func capabilityRefreshReplacesOnlyOnOKRetainsOnNOAndClosesOnBYE() async throws {
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),

@@ -184,6 +184,53 @@ import Testing
         }
     }
 
+    @Test(arguments: [false, true])
+    func quotedStringWireLengthHasIndependentRFCBound(escaped: Bool) throws {
+        let content = escaped ? String(repeating: "\\\\", count: 511) : String(repeating: "a", count: 1022)
+        let exact = Data(("\"" + content + "\"\r\nOK\r\n").utf8)
+        try expectEverySplit(of: exact, produces: [
+            ManageSieveWireLine(tokens: [.string(Data((escaped ? String(repeating: "\\", count: 511) : content).utf8))]),
+            ManageSieveWireLine(tokens: [.atom("OK")]),
+        ])
+        let oversized = Data(("\"" + content + "a\"\r\nOK\r\n").utf8)
+        for split in [0, 1023, 1024, oversized.count] {
+            var parser = ManageSieveResponseParser()
+            #expect(throws: ManageSieveParserError.quotedStringTooLong) {
+                _ = try parser.feed(oversized.prefix(split))
+                _ = try parser.feed(oversized.dropFirst(split))
+            }
+        }
+    }
+
+    @Test func oversizedFeedIsBoundedAndTerminalFailureReleasesStorage() throws {
+        var parser = ManageSieveResponseParser(limits: limits(line: 4096, aggregate: 32))
+        #expect(throws: ManageSieveParserError.aggregateResponseTooLong) {
+            try parser.feed(Data(repeating: 0x41, count: 1_000_000))
+        }
+        #expect(parser.peakBufferedByteCount <= 32)
+        #expect(parser.bufferedByteCount == 0)
+        #expect(parser.retainedBufferCapacity == 0)
+        #expect(throws: ManageSieveParserError.aggregateResponseTooLong) { try parser.feed(Data("OK\r\n".utf8)) }
+        #expect(parser.bufferedByteCount == 0)
+        #expect(parser.retainedBufferCapacity == 0)
+    }
+
+    @Test func finishFailureReleasesIncompleteStorage() throws {
+        var parser = ManageSieveResponseParser()
+        _ = try parser.feed(Data("\"unfinished".utf8))
+        #expect(throws: ManageSieveParserError.incompleteInput) { try parser.finish() }
+        #expect(parser.bufferedByteCount == 0)
+        #expect(parser.retainedBufferCapacity == 0)
+    }
+
+    @Test func boundedFeedStillAcceptsManyResponsesAndFragmentedSuffix() throws {
+        var parser = ManageSieveResponseParser(limits: limits(aggregate: 9))
+        let response = "\"x\"\r\nOK\r\n"
+        #expect(try parser.feed(Data((String(repeating: response, count: 1000) + "\"x").utf8)).count == 2000)
+        #expect(try parser.feed(Data("\"\r\nOK\r\n".utf8)).count == 2)
+        try parser.finish()
+    }
+
     private func expectEverySplit(
         of wire: Data,
         produces expected: [ManageSieveWireLine],

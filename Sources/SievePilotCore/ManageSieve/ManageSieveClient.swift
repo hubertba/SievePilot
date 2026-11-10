@@ -111,7 +111,7 @@ public actor ManageSieveClient {
                 var payload = ManageSieveAuthentication.plain(username: username, password: password)
                 defer { ManageSieveAuthentication.wipe(&payload) }
                 var command = Data("AUTHENTICATE \"PLAIN\" ".utf8)
-                command.append(ManageSieveAuthentication.quoted(payload))
+                command.append(ManageSieveAuthentication.string(payload))
                 command.append(contentsOf: [0x0d, 0x0a])
                 defer { ManageSieveAuthentication.wipe(&command) }
                 try await self.sendBytes(command)
@@ -161,7 +161,7 @@ public actor ManageSieveClient {
                     }) { throw ManageSieveClientError.parse }
                     var encoded = ManageSieveAuthentication.login(value)
                     defer { ManageSieveAuthentication.wipe(&encoded) }
-                    var command = ManageSieveAuthentication.quoted(encoded)
+                    var command = ManageSieveAuthentication.string(encoded)
                     command.append(contentsOf: [0x0d, 0x0a])
                     defer { ManageSieveAuthentication.wipe(&command) }
                     try await self.sendBytes(command)

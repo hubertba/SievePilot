@@ -88,7 +88,7 @@ ManageSieve strings are represented as raw `Data` first. Quoted strings decode e
 
 The parser accepts:
 
-- quoted strings with legal escaping;
+- quoted strings with legal escaping and at most 1024 wire octets including quotes and escapes;
 - server-to-client literals in the RFC 5804 form `{n}\r\n` only;
 - status atoms `OK`, `NO`, and `BYE` case-insensitively;
 - optional response codes and trailing strings;
@@ -104,9 +104,9 @@ RFC 5804, including verified errata, is normative for ManageSieve grammar and st
 
 The parser never searches past configured bounds:
 
-- maximum line length: 8 KiB;
+- maximum line length: 8 KiB of logical-line non-literal syntax, including literal headers but excluding CRLF delimiters and literal bodies;
 - maximum literal length: 10 MiB;
-- maximum aggregate response: 16 MiB;
+- maximum aggregate response: 16 MiB, including all framing (CRLF delimiters, literal headers, and bodies);
 - maximum capability/data lines per response: 256.
 
 The limits are collected in `ManageSieveLimits` and may be lowered in tests, but production defaults cannot be silently increased by server input.

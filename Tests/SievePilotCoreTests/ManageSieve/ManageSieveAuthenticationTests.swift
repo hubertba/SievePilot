@@ -35,6 +35,79 @@ import Testing
         catch { #expect(error as? ManageSieveClientError == expected) }
     }
 
+    @Test(arguments: [1022, 1023])
+    func authenticationStringEncodingUsesExactQuotedBoundaryOrImmediateLiteral(length: Int) {
+        let payload = Data(repeating: 0x41, count: length)
+        let encoded = ManageSieveAuthentication.string(payload)
+        var expected = Data((length == 1022 ? "\"" : "{1023+}\r\n").utf8)
+        expected.append(payload)
+        if length == 1022 { expected.append(0x22) }
+        if encoded != expected { Issue.record("Authentication string framing mismatch") }
+    }
+
+    // Base64 lengths are multiples of four: 1020 fits; the next possible length, 1024, does not.
+    @Test(arguments: [false, true])
+    func plainAndLoginUseLiteralForFirstOversizedBase64Payload(oversized: Bool) async throws {
+        let secret = String(repeating: "s", count: oversized ? 766 : 765)
+        for login in [false, true] {
+            let user = "u"
+            let raw = login ? Data(secret.utf8) : Data(([0] as [UInt8]) + Array(user.utf8) + [0] + Array(secret.dropLast(3).utf8))
+            let payload = raw.base64EncodedData()
+            #expect(payload.count == (oversized ? 1024 : 1020))
+            var expected = Data((login ? "" : "AUTHENTICATE \"PLAIN\" ").utf8)
+            expected.append(Data((oversized ? "{1024+}\r\n" : "\"").utf8))
+            expected.append(payload)
+            if !oversized { expected.append(0x22) }
+            expected.append(Data("\r\n".utf8))
+            let suffix: [FakeManageSieveTransport.Step] = login ? [
+                .write(Data("AUTHENTICATE \"LOGIN\"\r\n".utf8)), .read(Data("\"YQ==\"\r\n".utf8)),
+                .write(loginResponse(user)), .read(Data("\"Yg==\"\r\n".utf8)), .write(expected),
+            ] : [.write(expected)]
+            let (transport, _) = setup(suffix + [.read(Data("NO\r\n".utf8))])
+            let logger = RecordingManageSieveLogger()
+            let client = ManageSieveClient(transport: transport, clock: FakeManageSieveClock(),
+                timeoutPolicy: ManageSieveTimeoutPolicy(connect: .seconds(5), startTLS: .seconds(5), authentication: .seconds(5), command: .seconds(5)),
+                limits: .production, logger: logger)
+            _ = try await client.connectAndStartTLS(identity: identity)
+            var errorDescription = ""
+            do {
+                if login { try await client.authenticateLogin(username: user, password: secret) }
+                else { try await client.authenticatePlain(username: user, password: String(secret.dropLast(3))) }
+                Issue.record("Expected rejection")
+            } catch {
+                #expect(error as? ManageSieveClientError == .serverNo)
+                errorDescription = String(describing: error)
+            }
+            let reported = logger.events.map { String(describing: $0) }.joined() + errorDescription
+            if reported.contains(String(secret.prefix(700))) || reported.contains(String(decoding: payload, as: UTF8.self)) {
+                Issue.record("Sensitive authentication content leaked")
+            }
+            #expect(await client.state == .encryptedReady)
+            #expect(await transport.assertComplete())
+        }
+    }
+
+    @Test(arguments: ["IMPLEMENTATION", "VERSION", "SASL", "SIEVE", "OWNER", "LANGUAGE", "NOTIFY", "STARTTLS"])
+    func malformedRecognizedPostAuthCapabilityCloses(name: String) async throws {
+        let wire: String
+        if ["IMPLEMENTATION", "VERSION", "SASL", "SIEVE"].contains(name) {
+            wire = refreshed.components(separatedBy: "\r\n").map { $0.hasPrefix("\"" + name + "\"") ? "\"" + name + "\"" : $0 }.joined(separator: "\r\n")
+        } else {
+            wire = "\"" + name + "\"" + (name == "STARTTLS" ? " \"\"" : "") + "\r\n" + refreshed
+        }
+        let (transport, client) = setup([
+            .write(plainCommand(username, password)), .read(Data("OK\r\n".utf8)),
+            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(wire.utf8)),
+        ])
+        _ = try await client.connectAndStartTLS(identity: identity)
+        await expectError(.parse) { try await client.authenticatePlain(username: username, password: password) }
+        #expect(await client.state == .closed)
+        #expect(await client.capabilities == nil)
+        #expect(await transport.closeCount == 1)
+        #expect(await transport.assertComplete())
+    }
+
+
     @Test func plainSuccessRequiresCapabilityReacquisition() async throws {
         let (transport, client) = setup([
             .write(plainCommand(username, password)), .read(Data("OK\r\n".utf8)),
