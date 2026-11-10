@@ -17,6 +17,7 @@ actor FakeManageSieveTransport: ManageSieveTransport {
     private(set) var writes: [Data] = []
     private(set) var closeCount = 0
     private(set) var upgradeCount = 0
+    private(set) var slowReadStarted = false
     private(set) var violations: [String] = []
 
     init(_ steps: [Step]) { self.steps = steps }
@@ -46,6 +47,7 @@ actor FakeManageSieveTransport: ManageSieveTransport {
             if data.count > maxBytes { violations.append("oversized read") }
             return data
         case .slowRead:
+            slowReadStarted = true
             try await Task.sleep(for: .seconds(60))
             return Data()
         case .failure: throw FakeError.injected

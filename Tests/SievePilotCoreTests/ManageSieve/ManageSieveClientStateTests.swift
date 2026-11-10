@@ -201,6 +201,34 @@ import Testing
         #expect(await transport.closeCount == 1)
     }
 
+    @Test func cancellingCallerCancelsReadAndClosesBeforeDeadline() async {
+        let transport = FakeManageSieveTransport([.connect, .slowRead])
+        let client = makeClient(transport)
+        let completion = TimeoutCompletion()
+        let pending = Task {
+            do {
+                _ = try await client.connectAndStartTLS(identity: identity, timeout: .seconds(1))
+                await completion.complete(nil)
+            } catch {
+                await completion.complete(error as? ManageSieveClientError)
+            }
+        }
+        while !(await transport.slowReadStarted) { await Task.yield() }
+        pending.cancel()
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(await completion.didComplete, "Caller cancellation must not wait for the 1s deadline")
+        await pending.value // The RED implementation finishes at its one-second deadline.
+        #expect(await completion.error == .transport)
+        #expect(await client.state == .closed)
+        #expect(await client.capabilities == nil)
+        #expect(await transport.closeCount == 1)
+        #expect(await transport.writes.isEmpty)
+        #expect(await transport.assertComplete())
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(await client.state == .closed)
+        #expect(await transport.closeCount == 1)
+    }
+
     @Test func suspendedConnectTimesOutWithoutWaitingForOperationCancellation() async {
         let transport = FakeManageSieveTransport([.suspendConnect])
         let client = ManageSieveClient(

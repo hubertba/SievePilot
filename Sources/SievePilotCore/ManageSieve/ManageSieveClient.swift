@@ -224,22 +224,26 @@ public actor ManageSieveClient {
     ) async throws -> T {
         let gate = ManageSieveTimeoutGate()
         let operationTask = Task { try await operation() }
-        return try await withCheckedThrowingContinuation { continuation in
-            let timeoutTask = Task { [clock] in
-                do { try await clock.sleep(for: duration) } catch {
-                    if Task.isCancelled { return }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let timeoutTask = Task { [clock] in
+                    do { try await clock.sleep(for: duration) } catch {
+                        if Task.isCancelled { return }
+                    }
+                    guard !Task.isCancelled, await gate.claim() else { return }
+                    closeOnTimeout()
+                    operationTask.cancel()
+                    continuation.resume(throwing: ManageSieveClientError.timeout)
                 }
-                guard !Task.isCancelled, await gate.claim() else { return }
-                closeOnTimeout()
-                operationTask.cancel()
-                continuation.resume(throwing: ManageSieveClientError.timeout)
+                Task {
+                    let result = await operationTask.result
+                    guard await gate.claim() else { return }
+                    timeoutTask.cancel()
+                    continuation.resume(with: result)
+                }
             }
-            Task {
-                let result = await operationTask.result
-                guard await gate.claim() else { return }
-                timeoutTask.cancel()
-                continuation.resume(with: result)
-            }
+        } onCancel: {
+            operationTask.cancel()
         }
     }
 }
