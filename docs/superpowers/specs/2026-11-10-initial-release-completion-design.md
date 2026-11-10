@@ -61,7 +61,7 @@ The transport must not log inbound or outbound bytes. Its errors expose categori
 
 ### 2. TLS trust and service identity
 
-NIOSSL performs chain validation against system trust roots. A separate identity validator checks certificate SAN entries only:
+NIOSSL performs the in-place handshake and exposes the peer chain through a custom verification callback. A Security.framework trust evaluator validates that chain against the macOS system trust store; Swift Certificates parses SAN extensions for a separate service-identity validator:
 
 - manual host configuration supplies one explicit DNS-ID;
 - SRV discovery supplies `_sieve.<source-domain>` as an SRV-ID and the source domain as a DNS-ID;
@@ -77,7 +77,7 @@ Identity parsing and matching are pure functions with synthetic certificate/SAN 
 
 `AccountConfiguration` is a versioned Codable model containing stable `AccountID`, email address, auth username, source domain, discovered/manual endpoint, and TLS policy. V1 stores one account in Application Support through an atomic file replacement.
 
-`KeychainCredentialStore` uses Security.framework generic-password items scoped by account ID and endpoint. Password data is operation-local, never included in errors, and overwritten where mutable client-owned buffers permit.
+`KeychainCredentialStore` uses Security.framework generic-password items keyed by stable account ID within a fixed SievePilot service namespace; mutable endpoint settings are not credential identity. Password data is operation-local, never included in errors, and overwritten where mutable client-owned buffers permit.
 
 ### 4. Authenticated session factory
 
@@ -132,7 +132,7 @@ Opening the popover refreshes server state when stale. Wake/network reconnection
 
 ## Testing
 
-- NIO embedded-channel and loopback tests for connect, fragmentation, STARTTLS pipeline insertion, TLS failure, pending-I/O release, cancellation, and exactly-once close.
+- NIO embedded-channel and loopback tests for connect, fragmentation, STARTTLS pipeline insertion, coalesced plaintext `OK` plus first TLS record, TLS failure, pending-I/O release, cancellation, and exactly-once close.
 - Synthetic trust/identity tests for DNS-ID, SRV-ID, SAN-only behavior, wildcard restrictions, malformed SANs, and no Common Name fallback.
 - Discovery tests for priorities, weights, malformed records, no records, and manual fallback.
 - Keychain tests behind an injected Security client; one opt-in integration test uses a temporary service name and deletes it.

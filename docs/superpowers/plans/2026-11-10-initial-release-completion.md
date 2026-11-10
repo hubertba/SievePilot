@@ -39,6 +39,7 @@
 - Create: `Sources/SievePilotCore/Live/NIOManageSieveTransport.swift`
 - Create: `Sources/SievePilotCore/Live/NIOTransportErrors.swift`
 - Create: `Tests/SievePilotCoreTests/Live/NIOManageSieveTransportTests.swift`
+- Create: `Package.resolved`
 
 **Interfaces:**
 - Consumes: existing `ManageSieveTransport` and `ManageSieveTLSIdentityRequest`.
@@ -51,13 +52,13 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
         public let port: Int
     }
 
-    public init(endpoint: Endpoint, eventLoopGroup: EventLoopGroup? = nil)
+    public init(endpoint: Endpoint, eventLoopGroup: (any EventLoopGroup)? = nil)
 }
 ```
 
 - [ ] **Step 1: Add package dependencies and write failing plain-TCP transport tests**
 
-Add `swift-nio`, `swift-nio-ssl`, and `swift-certificates`; link `NIOCore`, `NIOPosix`, `NIOSSL`, and `X509` to `SievePilotCore`. Tests use a loopback `ServerBootstrap` and assert connect, fragmented reads, bounded read splitting, ordered writes, EOF, connect failure, pending-read release, idempotent close, and no byte-bearing error descriptions.
+Add explicit mutually compatible package ranges for `swift-nio`, `swift-nio-ssl`, and `swift-certificates`; link `NIOCore`, `NIOPosix`, `NIOSSL`, and `X509` to `SievePilotCore`, resolve them, and commit `Package.resolved`. Tests use a loopback `ServerBootstrap` and assert connect, fragmented reads, bounded read splitting, ordered writes, EOF, connect failure, pending connect/read/write release, idempotent close, external event-loop-group non-ownership, and no byte-bearing error descriptions.
 
 - [ ] **Step 2: Run RED**
 
@@ -66,7 +67,7 @@ Expected: FAIL because the transport does not exist.
 
 - [ ] **Step 3: Implement the actor-protected channel bridge**
 
-Use one channel inbound handler that forwards `ByteBuffer` chunks into a lock/actor-isolated queue. `read(maxBytes:)` returns at most the requested count and retains a suffix. `write(_:)` completes after `writeAndFlush`. `close()` resumes every pending continuation exactly once and shuts down only an internally owned event-loop group.
+Use one lifecycle state machine and waiter registry serialized on the channel event loop or behind one lock/actor. `read(maxBytes:)` returns at most the requested count and retains a suffix. `write(_:)` completes after `writeAndFlush`. `close()` atomically marks closed, resumes pending connect/read/write continuations exactly once, closes the channel, and shuts down only an internally owned event-loop group.
 
 `upgradeToTLS(identity:)` remains an explicit unsupported-state failure until Task 2; no plaintext authentication path is introduced.
 
@@ -85,7 +86,7 @@ Expected: transport suite and existing 141 tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Package.swift Sources/SievePilotCore/Live Tests/SievePilotCoreTests/Live
+git add Package.swift Package.resolved Sources/SievePilotCore/Live Tests/SievePilotCoreTests/Live
 git commit -m "feat: add live ManageSieve TCP transport"
 ```
 
@@ -108,16 +109,19 @@ public enum ManageSieveReferenceIdentifier: Equatable, Sendable {
     case srv(service: String, domain: String)
 }
 
+public protocol TLSChainTrustEvaluating: Sendable {
+    func evaluate(certificateChainDER: [Data]) async throws
+}
+
 public struct ManageSieveTLSIdentityValidator: Sendable {
     public func validate(
         certificateChain: [Certificate],
-        identifiers: [ManageSieveReferenceIdentifier],
-        trustRoots: CertificateStore
+        identifiers: [ManageSieveReferenceIdentifier]
     ) throws
 }
 ```
 
-Update `ManageSieveTLSIdentityRequest` to carry typed identifiers while retaining a deprecated compatibility initializer only if existing tests require it.
+`SecurityTLSChainTrustEvaluator` uses Security.framework and macOS system trust. Swift Certificates parses SAN extensions and performs DNS-ID/SRV-ID matching only. Update `ManageSieveTLSIdentityRequest` to carry typed identifiers and migrate all existing call sites; do not retain an ambiguous `[String]` production initializer.
 
 - [ ] **Step 1: Write failing pure identity tests**
 
@@ -130,15 +134,15 @@ Expected: FAIL on missing validator/types.
 
 - [ ] **Step 3: Implement chain and SAN validation**
 
-Use Swift Certificates for chain verification against system roots supplied by the production factory and for SAN parsing. Match DNS-ID and SRV-ID explicitly; the connection target is never added to identifiers implicitly.
+Use Security.framework `SecTrust` evaluation for the production macOS system chain trust decision. Use Swift Certificates only for deterministic fixture-chain tests and SAN parsing/matching. Match DNS-ID and SRV-ID (`otherName` OID `1.3.6.1.5.5.7.8.7`) explicitly; the connection target is never added to identifiers implicitly. Keep public TLS errors sanitized but distinguish chain-trust from service-identity failure.
 
 - [ ] **Step 4: Write failing STARTTLS pipeline tests**
 
-Use a loopback NIO server with a plaintext greeting/STARTTLS response followed by TLS. Assert insertion on the existing channel, successful encrypted reads/writes, handshake failure, identity mismatch, cancellation, close during handshake, and no post-failure writes.
+Use a loopback NIO server with a plaintext greeting/STARTTLS response followed by TLS. Assert insertion on the existing channel, successful encrypted reads/writes, handshake failure, identity mismatch, cancellation, close during handshake, and no post-failure writes. Include a delivery that coalesces `OK\r\n` and the first TLS record, plus fragmented TLS records.
 
 - [ ] **Step 5: Implement `upgradeToTLS(identity:)`**
 
-Insert `NIOSSLClientHandler` after plaintext bytes are drained. Complete only after handshake and custom verification succeed. Any failure closes the channel and releases pending operations.
+Serialize upgrade on the channel event loop. Pause application delivery at the exact plaintext response boundary, insert `NIOSSLClientHandler` before the application inbound bridge, and replay any already-buffered post-response bytes through the TLS handler. Complete only after handshake plus injected Security.framework chain trust and typed service-identity validation succeed. Any failure closes the channel and releases pending operations.
 
 - [ ] **Step 6: Run GREEN/full tests and commit**
 
@@ -162,6 +166,13 @@ git commit -m "feat: secure live ManageSieve STARTTLS"
 - Produces:
 
 ```swift
+public struct SieveSRVRecord: Equatable, Sendable {
+    public let priority: UInt16
+    public let weight: UInt16
+    public let port: UInt16
+    public let target: String
+}
+
 public struct SieveServiceEndpoint: Equatable, Sendable {
     public let host: String
     public let port: Int
@@ -172,14 +183,19 @@ public protocol SieveSRVResolving: Sendable {
     func records(for name: String) async throws -> [SieveSRVRecord]
 }
 
+public protocol SieveRandomSource: Sendable {
+    func next(upperBound: UInt64) -> UInt64
+}
+
 public struct SieveServiceDiscovery: Sendable {
+    public init(resolver: any SieveSRVResolving, random: any SieveRandomSource)
     public func discover(emailAddress: String) async throws -> SieveServiceEndpoint
 }
 ```
 
 - [ ] **Step 1: Write failing discovery tests**
 
-Cover email/domain validation, exact `_sieve._tcp.<domain>` query, priority ordering, deterministic weighted selection through injected randomness, trailing-dot normalization, invalid target/port, explicit no-service target `.`, timeout/cancellation, no records, and identifiers containing SRV-ID plus source-domain DNS-ID but not target DNS-ID.
+Cover last-`@` email/domain validation, canonical ASCII source domain, exact `_sieve._tcp.<domain>` query, lowest-priority selection, canonical ordering before a `0..<upperBound` injected draw, positive-weight cumulative selection, uniform all-zero selection, checked weight sums, trailing-dot normalization, invalid labels/target/port zero, explicit no-service target `.`, timeout/cancellation, duplicate/add-remove callbacks, no records, and identifiers ordered as `.srv(service: "sieve", domain:)` then source-domain `.dns`, never target DNS-ID.
 
 - [ ] **Step 2: Run RED**
 
@@ -187,7 +203,7 @@ Run: `. "$HOME/.swiftly/env.sh" && swift test --filter SieveServiceDiscoveryTest
 
 - [ ] **Step 3: Implement injected selection and production DNSService resolver**
 
-Wrap DNSService callbacks in cancellation-safe continuations. Bound record count and total response bytes. Discovery returns one endpoint; manual configuration is represented separately by Task 4.
+Wrap DNSService callbacks in one lock/actor-owned terminal state. Complete the first callback batch when `kDNSServiceFlagsMoreComing` clears, or on timeout/cancellation/error; deallocate the `DNSServiceRef` exactly once. Bound record count and cumulative RDATA bytes, parse SRV RDATA manually, and add the required DNS-SD linker setting. Discovery returns one endpoint; manual configuration is represented separately by Task 4.
 
 - [ ] **Step 4: Run GREEN/full tests and commit**
 
@@ -206,6 +222,8 @@ git commit -m "feat: discover ManageSieve services"
 - Create: `Sources/SievePilotCore/Account/AccountConfigurationStore.swift`
 - Create: `Sources/SievePilotCore/Account/KeychainCredentialStore.swift`
 - Create: `Tests/SievePilotCoreTests/Account/AccountConfigurationStoreTests.swift`
+- Create: `Sources/SievePilotCore/Account/AccountPersistenceCoordinator.swift`
+- Modify: `Sources/SievePilotCore/Domain/AccountID.swift`
 - Create: `Tests/SievePilotCoreTests/Account/KeychainCredentialStoreTests.swift`
 
 **Interfaces:**
@@ -217,21 +235,37 @@ public enum AccountEndpointPolicy: Equatable, Codable, Sendable {
     case manual(host: String, port: Int)
 }
 
+public enum AccountTLSPolicy: String, Codable, Sendable { case startTLS }
+
 public struct AccountConfiguration: Equatable, Codable, Sendable {
-    public let schemaVersion: Int
     public let accountID: AccountID
     public var emailAddress: String
     public var username: String
     public var endpointPolicy: AccountEndpointPolicy
+    public var tlsPolicy: AccountTLSPolicy
 }
 
-public protocol AccountConfigurationStoring: Sendable { /* load/save/delete */ }
-public protocol CredentialStoring: Sendable { /* read/write/delete password Data */ }
+public protocol AccountConfigurationStoring: Sendable {
+    func load() async throws -> AccountConfiguration?
+    func save(_ configuration: AccountConfiguration) async throws
+    func delete() async throws
+}
+
+public protocol CredentialStoring: Sendable {
+    func read(accountID: AccountID) async throws -> Data?
+    func write(_ password: Data, accountID: AccountID) async throws
+    func delete(accountID: AccountID) async throws
+}
+
+public actor AccountPersistenceCoordinator {
+    public func save(configuration: AccountConfiguration, password: Data) async throws
+    public func delete(accountID: AccountID) async throws
+}
 ```
 
 - [ ] **Step 1: Write failing validation/persistence tests**
 
-Cover schema v1 round-trip, atomic replacement, corrupt/unknown-version fail-closed behavior, no secret fields in JSON, email/username/manual endpoint validation, and stable account IDs.
+Cover explicit tagged schema-v1 JSON, atomic replacement preserving previous bytes on failure, corrupt/unknown-version fail-closed behavior, no secret fields in JSON, email/username/manual endpoint validation, fixed `.startTLS`, and stable account IDs encoded as lowercase UUID strings.
 
 - [ ] **Step 2: Write failing Keychain-boundary tests**
 
@@ -243,7 +277,7 @@ Run: `. "$HOME/.swiftly/env.sh" && swift test --filter 'AccountConfigurationStor
 
 - [ ] **Step 4: Implement settings and Keychain stores**
 
-Store settings under Application Support with data protection/owner-only file permissions where available. Provide one coordinator operation that saves credentials first, atomically saves settings second, and removes the newly written credential if settings save fails.
+Store one fixed v1 settings file under an injected Application Support base directory: app directory mode `0700`, final JSON mode `0600`, same-directory temporary write plus atomic rename/replace. The coordinator snapshots prior configuration and credential, writes the new credential, then settings; on settings failure it restores the prior credential or deletes only when no prior item existed. Rollback failure returns a distinct inconsistent-state error. Delete settings first so the account becomes unusable, then delete the credential with explicit failure reporting.
 
 - [ ] **Step 5: Run GREEN/full tests and commit**
 
@@ -269,10 +303,27 @@ git commit -m "feat: persist SievePilot account credentials"
 - Produces:
 
 ```swift
+public protocol AuthenticatedManageSieveSession: Sendable {
+    var capabilities: ManageSieveCapabilities { get async }
+    func listScripts(timeout: Duration?) async throws -> [ManageSieveScriptEntry]
+    func getScript(name: String, timeout: Duration?) async throws -> Data
+    func checkScript(_ script: Data, timeout: Duration?) async throws -> ManageSieveCommandResult
+    func putScript(name: String, script: Data, timeout: Duration?) async throws -> ManageSieveCommandResult
+    func setActive(name: String, timeout: Duration?) async throws
+    func deleteScript(name: String, timeout: Duration?) async throws
+}
+
+public protocol ManageSieveSessionProviding: Sendable {
+    func withAuthenticatedSession<T: Sendable>(
+        account: AccountConfiguration,
+        _ operation: @Sendable (any AuthenticatedManageSieveSession) async throws -> T
+    ) async throws -> T
+}
+
 public struct VerifiedAccountSnapshot: Equatable, Sendable {
     public let activeScriptName: String?
     public let activeScript: Data?
-    public let outOfOfficeState: OutOfOfficeState
+    public let outOfOfficeState: VerifiedOutOfOfficeState
     public let verifiedAt: Date
     public let capabilities: ManageSieveCapabilities
 }
@@ -303,11 +354,11 @@ Cover no active script, active binary script, verified on/off/expired, malformed
 
 - [ ] **Step 4: Write failing mutation transcript tests**
 
-Cover baseline digest, candidate patching, `CHECKSCRIPT`, random owned name collision retry, `PUTSCRIPT`, repeated baseline check, conflict before activation, `SETACTIVE`, read-back verification, interruption returning unknown, quota/NO, no overwrite of user names, manifest persistence, rollback eligibility, and conservative retention after manifest loss.
+Cover raw-byte baseline digest, candidate patching with fresh `ManagedScriptMetadata`, optional `CHECKSCRIPT` only when the ManageSieve `CHECKSCRIPT` capability is advertised, cryptographically random owned name collision retry against all names, `PUTSCRIPT`, repeated active-name plus byte-digest baseline check, conflict before activation, the documented unavoidable final `SETACTIVE` race, read-back verification, interruption returning unknown, quota/NO, no overwrite of any existing name, prepared/uploaded/verified manifest states, rollback eligibility, manifest-write failure after activation returning unknown, and conservative retention after manifest loss.
 
 - [ ] **Step 5: Implement repository and manifest**
 
-Use injected session/client factories, clock, random bytes, and stores. SHA-256 uses CryptoKit. Every mutation starts with refresh and returns success only after byte-identical active read-back.
+Use the closure-based session provider, injected clock, random bytes, and stores. SHA-256 uses CryptoKit over raw `Data`. Serialize per-account mutations in the service actor. Persist a prepared manifest record before upload, uploaded state after upload, and verified-active state only after active-name plus byte-identical read-back. Every mutation starts with refresh and returns success only after verification; optimistic concurrency cannot eliminate the final protocol race and must never be described as atomic.
 
 - [ ] **Step 6: Run GREEN/full tests and commit**
 
@@ -327,12 +378,14 @@ git commit -m "feat: safely manage server Sieve versions"
 - Create: `SievePilotApp/AppDependencies.swift`
 - Create: `SievePilotApp/Views/SetupView.swift`
 - Create: `SievePilotApp/Views/StatusBanner.swift`
+- Create: `SievePilotApp/AppLifecycleCoordinator.swift`
 - Modify: `SievePilotApp/SievePilotApp.swift`
+- Modify: `Scripts/validate_xcode_project.py`
 - Rewrite: `SievePilotAppTests/AppModelTests.swift`
 
 **Interfaces:**
 - Consumes: account coordinator, discovery, session factory, and account service protocols.
-- Produces an `@MainActor @Observable final class AppModel` with setup form fields, persisted-account state, operation state, verified snapshot, persistent user-facing error, `load()`, `testAndSave()`, `refresh()`, and `deleteAccount()`.
+- Produces an `@MainActor final class AppModel: ObservableObject` with `@Published` setup form fields, persisted-account state, operation state, verified snapshot, persistent user-facing error, `load()`, `testAndSave()`, `refresh()`, and `deleteAccount()`. Its injected initializer accepts account/session/service protocols plus clock, calendar/time-zone, and lifecycle boundaries.
 
 - [ ] **Step 1: Write failing app-model tests**
 
@@ -344,7 +397,7 @@ Run: `xcodebuild test -project SievePilot.xcodeproj -scheme SievePilot -destinat
 
 - [ ] **Step 3: Implement dependencies, observable model, and setup view**
 
-Views invoke model methods only. Password remains in setup state only until stored; clearing/deleting account removes the Keychain item.
+Views invoke model methods only. Password remains in setup state only until stored; clearing/deleting account removes the Keychain item. Use cancellable operation tasks plus generation tokens so stale completions cannot overwrite newer state. Add every new app/test source to explicit PBX groups/build phases and extend the project validator accordingly.
 
 - [ ] **Step 4: Run GREEN plus validators**
 
@@ -377,7 +430,7 @@ git commit -m "feat: add SievePilot account setup"
 
 - [ ] **Step 1: Write failing model/UI-flow tests**
 
-Cover verified on/off/expired labels, blank subject, non-empty message, future expiry, DST gap/repeated-time handling, missing `vacation`/`date`/`relational`, Save and Activate, Disable, conflict, unknown activation, persistent errors, manual Refresh, popover stale refresh, wake/reconnect stale marking, and no inferred success.
+Cover verified on/off/expired labels, blank subject, non-empty message, future expiry, DST gap/repeated-time handling, missing `vacation`/`date`/`relational`, Save and Activate, Disable, conflict, unknown activation, persistent errors, manual Refresh, coalesced popover-open refresh, wake/reconnect stale marking, stale-generation suppression, and no inferred success.
 
 - [ ] **Step 2: Run RED**
 
@@ -385,7 +438,7 @@ Run: `xcodebuild test -project SievePilot.xcodeproj -scheme SievePilot -destinat
 
 - [ ] **Step 3: Implement operational menu UI**
 
-Match the approved compact popover design. Disable mutation controls during operations. Display verification timestamps and explicit capability limitations. Add Settings and Quit actions.
+Match the approved compact popover design. Disable mutation controls during operations. Display verification timestamps and explicit capability limitations. Add Settings and Quit actions. Production lifecycle coordination uses `NSWorkspace.didWakeNotification` and a network-path monitor behind an injected protocol; it marks state stale immediately and coalesces refreshes. These are host-app/model tests, not UI-automation claims.
 
 - [ ] **Step 4: Run GREEN/full verification**
 
