@@ -15,6 +15,7 @@ actor FakeManageSieveTransport: ManageSieveTransport {
     private var steps: [Step]
     private var connectContinuation: CheckedContinuation<Void, Never>?
     private(set) var writes: [Data] = []
+    private(set) var readCount = 0
     private(set) var closeCount = 0
     private(set) var upgradeCount = 0
     private(set) var slowReadStarted = false
@@ -42,6 +43,7 @@ actor FakeManageSieveTransport: ManageSieveTransport {
     var isConnectSuspended: Bool { connectContinuation != nil }
 
     func read(maxBytes: Int) async throws -> Data {
+        readCount += 1
         switch take() {
         case let .read(data):
             if data.count > maxBytes { violations.append("oversized read") }

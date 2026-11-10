@@ -13,6 +13,8 @@ public enum ManageSieveClientError: Error, Equatable, Sendable {
     case invalidState
     case invalidIdentity
     case invalidCredentials
+    case invalidScriptName
+    case invalidScript
     case unsupportedMechanism
     case missingStartTLS
     case unexpectedEOF
@@ -71,13 +73,13 @@ public actor ManageSieveClient {
         }
     }
 
-    public func capability() async throws -> ManageSieveCapabilities {
-        guard state == .encryptedReady, !admittedOperation, capabilities != nil else {
+    public func capability(timeout: Duration? = nil) async throws -> ManageSieveCapabilities {
+        guard (state == .encryptedReady || state == .authenticated), !admittedOperation, capabilities != nil else {
             throw ManageSieveClientError.invalidState
         }
         admittedOperation = true
         do {
-            let replacement = try await withTimeout(timeoutPolicy.command) {
+            let replacement = try await withTimeout(timeout ?? timeoutPolicy.command) {
                 try await self.refreshCapabilities()
             }
             try ensureOpen()
@@ -238,6 +240,151 @@ public actor ManageSieveClient {
         case .ok: break
         case .no: throw ManageSieveClientError.serverNo
         case .bye: throw ManageSieveClientError.serverBye
+        }
+    }
+
+    public func listScripts(timeout: Duration? = nil) async throws -> [ManageSieveScriptEntry] {
+        try await scriptOperation(timeout: timeout, command: Data("LISTSCRIPTS\r\n".utf8)) { response in
+            var seen = Set<String>()
+            var activeCount = 0
+            var entries: [ManageSieveScriptEntry] = []
+            for line in response.dataLines {
+                guard (1...2).contains(line.tokens.count),
+                      case let .string(bytes) = line.tokens[0],
+                      let name = String(data: bytes, encoding: .utf8),
+                      !name.isEmpty, !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                      seen.insert(name).inserted else { throw ManageSieveClientError.parse }
+                let active = line.tokens.count == 2
+                if active {
+                    guard case .atom("ACTIVE") = line.tokens[1] else { throw ManageSieveClientError.parse }
+                    activeCount += 1
+                    guard activeCount <= 1 else { throw ManageSieveClientError.parse }
+                }
+                entries.append(ManageSieveScriptEntry(name: name, isActive: active))
+            }
+            return entries
+        }
+    }
+
+    public func getScript(name: String, timeout: Duration? = nil) async throws -> Data {
+        let encoded = try scriptName(name)
+        return try await scriptOperation(timeout: timeout, command: command("GETSCRIPT ", encoded)) { response in
+            guard response.dataLines.count == 1,
+                  case let .string(script) = response.dataLines[0].tokens.first,
+                  response.dataLines[0].tokens.count == 1 else { throw ManageSieveClientError.parse }
+            return script
+        }
+    }
+
+    public func checkScript(_ script: Data, timeout: Duration? = nil) async throws -> ManageSieveCommandResult {
+        try validateScript(script)
+        return try await scriptOperation(timeout: timeout, command: literalCommand("CHECKSCRIPT ", script: script)) { response in
+            try self.emptyResult(response)
+        }
+    }
+
+    public func putScript(name: String, script: Data, timeout: Duration? = nil) async throws -> ManageSieveCommandResult {
+        let encoded = try scriptName(name)
+        try validateScript(script)
+        var prefix = Data("PUTSCRIPT ".utf8)
+        prefix.append(encoded)
+        prefix.append(0x20)
+        return try await scriptOperation(timeout: timeout, command: literalCommand(prefix, script: script)) { response in
+            try self.emptyResult(response)
+        }
+    }
+
+    public func setActive(name: String, timeout: Duration? = nil) async throws {
+        let encoded = try scriptName(name, allowEmpty: true)
+        _ = try await scriptOperation(timeout: timeout, command: command("SETACTIVE ", encoded)) { response in
+            try self.emptyResult(response)
+        }
+    }
+
+    public func deleteScript(name: String, timeout: Duration? = nil) async throws {
+        let encoded = try scriptName(name)
+        _ = try await scriptOperation(timeout: timeout, command: command("DELETESCRIPT ", encoded)) { response in
+            try self.emptyResult(response)
+        }
+    }
+
+    public func logout(timeout: Duration? = nil) async throws {
+        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
+        admittedOperation = true
+        do {
+            try await withTimeout(timeout ?? timeoutPolicy.command) {
+                try await self.send("LOGOUT\r\n")
+                let response = try await self.readResponse()
+                guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
+                guard response.status.status != .no else { throw ManageSieveClientError.serverNo }
+            }
+            await closeAfterFailure()
+        } catch {
+            await closeAfterFailure()
+            throw sanitized(error)
+        }
+    }
+
+    private func scriptName(_ name: String, allowEmpty: Bool = false) throws -> Data {
+        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
+        return try ManageSieveCommandEncoding.name(name, allowEmpty: allowEmpty, maximumLiteralLength: limits.maximumLiteralLength)
+    }
+
+    private func validateScript(_ script: Data) throws {
+        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
+        guard !script.isEmpty, script.count <= min(limits.maximumLiteralLength, 10 * 1024 * 1024),
+              UInt32(exactly: script.count) != nil else { throw ManageSieveClientError.invalidScript }
+    }
+
+    private func command(_ prefix: String, _ name: Data) -> Data {
+        var bytes = Data(prefix.utf8)
+        bytes.append(name)
+        bytes.append(contentsOf: [0x0d, 0x0a])
+        return bytes
+    }
+
+    private func literalCommand(_ prefix: String, script: Data) -> Data {
+        literalCommand(Data(prefix.utf8), script: script)
+    }
+
+    private func literalCommand(_ prefix: Data, script: Data) -> Data {
+        var bytes = prefix
+        bytes.append(Data("{\(script.count)+}\r\n".utf8))
+        bytes.append(script)
+        bytes.append(contentsOf: [0x0d, 0x0a])
+        return bytes
+    }
+
+    nonisolated private func emptyResult(_ response: ManageSieveCommandResponse) throws -> ManageSieveCommandResult {
+        guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
+        return ManageSieveCommandResult(responseCode: response.status.responseCode, message: response.status.message)
+    }
+
+    private func scriptOperation<T: Sendable>(
+        timeout: Duration?, command: Data,
+        interpret: @escaping @Sendable (ManageSieveCommandResponse) throws -> T
+    ) async throws -> T {
+        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
+        admittedOperation = true
+        do {
+            let value = try await withTimeout(timeout ?? timeoutPolicy.command) {
+                try await self.sendBytes(command)
+                let response = try await self.readResponse()
+                guard response.dataLines.isEmpty || response.status.status == .ok else {
+                    throw ManageSieveClientError.parse
+                }
+                try self.requireOK(response)
+                return try interpret(response)
+            }
+            try ensureOpen()
+            admittedOperation = false
+            return value
+        } catch let error as ManageSieveClientError where error == .serverNo && state == .authenticated {
+            admittedOperation = false
+            throw error
+        } catch {
+            await closeAfterFailure()
+            throw sanitized(error)
         }
     }
 
