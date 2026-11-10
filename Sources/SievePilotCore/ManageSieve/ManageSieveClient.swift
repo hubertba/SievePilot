@@ -5,12 +5,15 @@ public enum ManageSieveClientState: Equatable, Sendable {
     case connecting
     case startTLS
     case encryptedReady
+    case authenticated
     case closed
 }
 
 public enum ManageSieveClientError: Error, Equatable, Sendable {
     case invalidState
     case invalidIdentity
+    case invalidCredentials
+    case unsupportedMechanism
     case missingStartTLS
     case unexpectedEOF
     case parse
@@ -90,6 +93,149 @@ public actor ManageSieveClient {
         }
     }
 
+    public func authenticatePlain(username: String, password: String, timeout: Duration? = nil) async throws {
+        try admitAuthentication("PLAIN")
+        guard !username.contains("\0"), !password.contains("\0") else {
+            throw ManageSieveClientError.invalidCredentials
+        }
+        admittedOperation = true
+        logger.record(.authenticationStarted(mechanism: "PLAIN"))
+        var accepted = false
+        do {
+            try await withTimeout(timeout ?? timeoutPolicy.authentication) {
+                var payload = ManageSieveAuthentication.plain(username: username, password: password)
+                defer { ManageSieveAuthentication.wipe(&payload) }
+                var command = Data("AUTHENTICATE \"PLAIN\" ".utf8)
+                command.append(ManageSieveAuthentication.quoted(payload))
+                command.append(contentsOf: [0x0d, 0x0a])
+                defer { ManageSieveAuthentication.wipe(&command) }
+                try await self.sendBytes(command)
+                let response = try await self.readResponse()
+                try self.requireOK(response)
+                guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
+            }
+            accepted = true
+            try await finishAuthentication(timeout: timeout)
+        } catch let error as ManageSieveClientError where error == .serverNo && !accepted && state == .encryptedReady {
+            admittedOperation = false
+            logger.record(.authenticationRejected)
+            throw error
+        } catch {
+            await closeAfterFailure()
+            throw sanitized(error)
+        }
+    }
+
+    public func authenticateLogin(username: String, password: String, timeout: Duration? = nil) async throws {
+        try admitAuthentication("LOGIN")
+        guard username.count < 64,
+              !username.contains("\0"), !username.contains("\r"), !username.contains("\n"),
+              !password.contains("\0"), !password.contains("\r"), !password.contains("\n") else {
+            throw ManageSieveClientError.invalidCredentials
+        }
+        admittedOperation = true
+        logger.record(.authenticationStarted(mechanism: "LOGIN"))
+        var accepted = false
+        do {
+            try await withTimeout(timeout ?? timeoutPolicy.authentication) {
+                try await self.send("AUTHENTICATE \"LOGIN\"\r\n")
+                var parser = ManageSieveResponseParser(limits: self.limits)
+                var pending: [ManageSieveWireLine] = []
+                for value in [username, password] {
+                    let line = try await self.readAuthenticationLine(parser: &parser, pending: &pending)
+                    try self.requireChallenge(line)
+                    if pending.contains(where: { line in
+                        if case let .atom(word)? = line.tokens.first {
+                            return ["OK", "NO", "BYE"].contains(word.uppercased())
+                        }
+                        return false
+                    }) { throw ManageSieveClientError.parse }
+                    var encoded = ManageSieveAuthentication.login(value)
+                    defer { ManageSieveAuthentication.wipe(&encoded) }
+                    var command = ManageSieveAuthentication.quoted(encoded)
+                    command.append(contentsOf: [0x0d, 0x0a])
+                    defer { ManageSieveAuthentication.wipe(&command) }
+                    try await self.sendBytes(command)
+                }
+                let terminal = try await self.readAuthenticationLine(parser: &parser, pending: &pending)
+                guard pending.isEmpty else { throw ManageSieveClientError.parse }
+                do { try parser.finish() } catch { throw ManageSieveClientError.parse }
+                let status: ManageSieveStatusResponse
+                do { status = try ManageSieveStatusResponse(line: terminal) }
+                catch { throw ManageSieveClientError.parse }
+                try self.requireStatus(status.status)
+            }
+            accepted = true
+            try await finishAuthentication(timeout: timeout)
+        } catch let error as ManageSieveClientError where error == .serverNo && !accepted && state == .encryptedReady {
+            admittedOperation = false
+            logger.record(.authenticationRejected)
+            throw error
+        } catch {
+            await closeAfterFailure()
+            throw sanitized(error)
+        }
+    }
+
+    private func admitAuthentication(_ mechanism: String) throws {
+        guard state == .encryptedReady, !admittedOperation, let capabilities,
+              capabilities.isAuthoritative else { throw ManageSieveClientError.invalidState }
+        guard capabilities.supportsSASLMechanism(mechanism) else {
+            throw ManageSieveClientError.unsupportedMechanism
+        }
+    }
+
+    private func finishAuthentication(timeout: Duration?) async throws {
+        let replacement = try await withTimeout(timeout ?? timeoutPolicy.authentication) {
+            try await self.refreshCapabilities()
+        }
+        try ensureOpen()
+        capabilities = replacement
+        state = .authenticated
+        admittedOperation = false
+        logger.record(.authenticated)
+    }
+
+    private func readAuthenticationLine(
+        parser: inout ManageSieveResponseParser,
+        pending: inout [ManageSieveWireLine]
+    ) async throws -> ManageSieveWireLine {
+        while pending.isEmpty {
+            try ensureOpen()
+            let bytes: Data
+            do { bytes = try await transport.read(maxBytes: 4096) }
+            catch { throw ManageSieveClientError.transport }
+            try ensureOpen()
+            guard !bytes.isEmpty else { throw ManageSieveClientError.unexpectedEOF }
+            do { pending = try parser.feed(bytes) }
+            catch { throw ManageSieveClientError.parse }
+        }
+        return pending.removeFirst()
+    }
+
+    nonisolated private func requireChallenge(_ line: ManageSieveWireLine) throws {
+        if let first = line.tokens.first, case let .atom(word) = first,
+           ["OK", "NO", "BYE"].contains(word.uppercased()) {
+            let status: ManageSieveStatusResponse
+            do { status = try ManageSieveStatusResponse(line: line) }
+            catch { throw ManageSieveClientError.parse }
+            try requireStatus(status.status)
+            throw ManageSieveClientError.parse
+        }
+        guard line.tokens.count == 1, case let .string(value) = line.tokens[0],
+              ManageSieveAuthentication.isBase64Challenge(value) else {
+            throw ManageSieveClientError.parse
+        }
+    }
+
+    nonisolated private func requireStatus(_ status: ManageSieveStatus) throws {
+        switch status {
+        case .ok: break
+        case .no: throw ManageSieveClientError.serverNo
+        case .bye: throw ManageSieveClientError.serverBye
+        }
+    }
+
     public func close() async {
         guard state != .closed else { return }
         state = .closed
@@ -135,8 +281,12 @@ public actor ManageSieveClient {
     }
 
     private func send(_ command: String) async throws {
+        try await sendBytes(Data(command.utf8))
+    }
+
+    private func sendBytes(_ bytes: Data) async throws {
         try ensureOpen()
-        do { try await transport.write(Data(command.utf8)) } catch {
+        do { try await transport.write(bytes) } catch {
             throw ManageSieveClientError.transport
         }
         try ensureOpen()
@@ -175,7 +325,7 @@ public actor ManageSieveClient {
         }
     }
 
-    private func requireOK(_ response: ManageSieveCommandResponse) throws {
+    nonisolated private func requireOK(_ response: ManageSieveCommandResponse) throws {
         switch response.status.status {
         case .ok: break
         case .no: throw ManageSieveClientError.serverNo

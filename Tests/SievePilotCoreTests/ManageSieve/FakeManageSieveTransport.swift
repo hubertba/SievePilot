@@ -105,3 +105,20 @@ struct ImmediateManageSieveClock: ManageSieveClock {
 struct FakeManageSieveLogger: ManageSieveLogger {
     func record(_ event: ManageSieveLogEvent) {}
 }
+
+final class RecordingManageSieveLogger: ManageSieveLogger, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [ManageSieveLogEvent] = []
+
+    func record(_ event: ManageSieveLogEvent) {
+        lock.lock()
+        stored.append(event)
+        lock.unlock()
+    }
+
+    var events: [ManageSieveLogEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
