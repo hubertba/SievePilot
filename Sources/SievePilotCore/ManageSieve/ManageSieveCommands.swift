@@ -20,16 +20,12 @@ public struct ManageSieveCommandResult: Equatable, Sendable {
     }
 }
 
-// Only printable ASCII is legal inside RFC 2244 quoted strings; other UTF-8 uses a literal.
+// RFC 2244 quoted strings admit non-NUL ASCII other than CR/LF; UTF-8 outside ASCII uses a literal.
 enum ManageSieveCommandEncoding {
     static func name(_ name: String, allowEmpty: Bool, maximumLiteralLength: Int) throws -> Data {
         let bytes = Data(name.utf8)
         guard (allowEmpty || !bytes.isEmpty),
-              !bytes.contains(where: { $0 < 0x20 || $0 == 0x7f }) else {
-            throw ManageSieveClientError.invalidScriptName
-        }
-        // C1 Unicode controls have UTF-8 encodings, so inspect scalars as well as ASCII bytes.
-        guard !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+              !bytes.contains(where: { $0 == 0 || $0 == 0x0d || $0 == 0x0a }) else {
             throw ManageSieveClientError.invalidScriptName
         }
         if bytes.allSatisfy({ $0 <= 0x7e }) {

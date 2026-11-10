@@ -75,7 +75,7 @@ import Testing
 
     @Test func invalidInputAndIllegalStateNeverWrite() async throws {
         let (transport, client) = try await client([])
-        for name in ["", "bad\0name", "bad\rname", "bad\nname", "bad\u{0001}name"] {
+        for name in ["", "bad\0name", "bad\rname", "bad\nname"] {
             await expect(.invalidScriptName) { _ = try await client.getScript(name: name) }
             await expect(.invalidScriptName) { _ = try await client.putScript(name: name, script: Data([65])) }
             await expect(.invalidScriptName) { try await client.deleteScript(name: name) }
@@ -148,6 +148,44 @@ import Testing
         ])
         try await client.deleteScript(name: quoted)
         try await client.deleteScript(name: literal)
+        #expect(await transport.assertComplete())
+    }
+
+    @Test func authenticatedCapabilityRejectsDataBeforeNo() async throws {
+        let (transport, client) = try await client([
+            .write(Data("CAPABILITY\r\n".utf8)), .read(Data("123\r\nNO\r\n".utf8)),
+        ])
+        await expect(.parse) { _ = try await client.capability() }
+        #expect(await client.state == .closed)
+        #expect(await client.capabilities == nil)
+        #expect(await transport.assertComplete())
+    }
+
+    @Test func quotedTabAndUnicodeControlLiteralRoundTrip() async throws {
+        let tabName = "a\tb"
+        let controlName = "a\u{0085}b"
+        let controlBytes = Data(controlName.utf8)
+        let (transport, client) = try await client([
+            .write(Data("PUTSCRIPT \"a\tb\" {1+}\r\nx\r\n".utf8)), .read(Data("OK\r\n".utf8)),
+            .write(Data("GETSCRIPT {\(controlBytes.count)+}\r\n".utf8) + controlBytes + Data("\r\n".utf8)),
+            .read(Data("{1}\r\nx\r\nOK\r\n".utf8)),
+            .write(Data("LISTSCRIPTS\r\n".utf8)),
+            .read(Data("\"a\tb\" aCtIvE\r\n{\(controlBytes.count)}\r\n".utf8) + controlBytes + Data("\r\nOK\r\n".utf8)),
+        ])
+        _ = try await client.putScript(name: tabName, script: Data("x".utf8))
+        #expect(try await client.getScript(name: controlName) == Data("x".utf8))
+        #expect(try await client.listScripts() == [
+            ManageSieveScriptEntry(name: tabName, isActive: true),
+            ManageSieveScriptEntry(name: controlName, isActive: false),
+        ])
+        #expect(await transport.assertComplete())
+    }
+
+    @Test func listScriptsAcceptsLowercaseActive() async throws {
+        let (transport, client) = try await client([
+            .write(Data("LISTSCRIPTS\r\n".utf8)), .read(Data("\"CaseName\" active\r\nOK\r\n".utf8)),
+        ])
+        #expect(try await client.listScripts() == [ManageSieveScriptEntry(name: "CaseName", isActive: true)])
         #expect(await transport.assertComplete())
     }
 

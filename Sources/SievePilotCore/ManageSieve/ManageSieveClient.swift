@@ -252,11 +252,13 @@ public actor ManageSieveClient {
                 guard (1...2).contains(line.tokens.count),
                       case let .string(bytes) = line.tokens[0],
                       let name = String(data: bytes, encoding: .utf8),
-                      !name.isEmpty, !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                      !name.isEmpty, !bytes.contains(where: { $0 == 0 || $0 == 0x0d || $0 == 0x0a }),
                       seen.insert(name).inserted else { throw ManageSieveClientError.parse }
                 let active = line.tokens.count == 2
                 if active {
-                    guard case .atom("ACTIVE") = line.tokens[1] else { throw ManageSieveClientError.parse }
+                    guard case let .atom(marker) = line.tokens[1], marker.uppercased() == "ACTIVE" else {
+                        throw ManageSieveClientError.parse
+                    }
                     activeCount += 1
                     guard activeCount <= 1 else { throw ManageSieveClientError.parse }
                 }
@@ -428,6 +430,9 @@ public actor ManageSieveClient {
     private func refreshCapabilities() async throws -> ManageSieveCapabilities {
         try await send("CAPABILITY\r\n")
         let response = try await readResponse()
+        guard response.status.status == .ok || response.dataLines.isEmpty else {
+            throw ManageSieveClientError.parse
+        }
         try requireOK(response)
         return try interpret(response, origin: .postTLSCapability)
     }
