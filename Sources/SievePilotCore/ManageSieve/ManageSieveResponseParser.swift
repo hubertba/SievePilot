@@ -175,6 +175,9 @@ private struct LineParser {
             case 0x0d, 0x00:
                 throw ManageSieveParserError.malformedSyntax
             default:
+                guard (0x01...0x7f).contains(bytes[cursor]) else {
+                    throw ManageSieveParserError.malformedSyntax
+                }
                 value.append(bytes[cursor])
                 try consumeSyntaxByte()
             }

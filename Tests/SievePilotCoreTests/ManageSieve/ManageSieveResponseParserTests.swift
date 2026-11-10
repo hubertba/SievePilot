@@ -57,6 +57,27 @@ import Testing
         ])
     }
 
+    @Test func invalidQuotedByteIsRejectedWhileLiteralBytesRemainOpaque() throws {
+        var quotedWire = Data([0x22, 0xff, 0x22])
+        quotedWire.append(Data("\r\nOK\r\n".utf8))
+        var quotedParser = ManageSieveResponseParser()
+
+        #expect(throws: ManageSieveParserError.malformedSyntax) {
+            try quotedParser.feed(quotedWire)
+        }
+
+        var literalWire = Data("{1}\r\n".utf8)
+        literalWire.append(0xff)
+        literalWire.append(Data("\r\nOK\r\n".utf8))
+        var literalParser = ManageSieveResponseParser()
+
+        #expect(try literalParser.feed(literalWire) == [
+            ManageSieveWireLine(tokens: [.string(Data([0xff]))]),
+            ManageSieveWireLine(tokens: [.atom("OK")]),
+        ])
+        try literalParser.finish()
+    }
+
     @Test func nestedParenthesizedTokensArePreserved() throws {
         let wire = Data("NO (WARNINGS (3 \"bad\")) \"failed\"\r\n".utf8)
         var parser = ManageSieveResponseParser()
