@@ -11,6 +11,8 @@ public enum ManageSieveClientState: Equatable, Sendable {
 
 public enum ManageSieveClientError: Error, Equatable, Sendable {
     case invalidState
+    case operationInProgress
+    case cancelled
     case invalidIdentity
     case invalidCredentials
     case invalidScriptName
@@ -32,7 +34,7 @@ public actor ManageSieveClient {
     private let timeoutPolicy: ManageSieveTimeoutPolicy
     private let limits: ManageSieveLimits
     private let logger: any ManageSieveLogger
-    private var admittedOperation = false
+    private var admittedOperation: ManageSieveOperationAdmission?
     public private(set) var capabilities: ManageSieveCapabilities?
     public private(set) var state: ManageSieveClientState = .disconnected
 
@@ -54,18 +56,19 @@ public actor ManageSieveClient {
         identity: ManageSieveTLSIdentityRequest,
         timeout: Duration? = nil
     ) async throws -> ManageSieveCapabilities {
-        guard state == .disconnected, !admittedOperation else { throw ManageSieveClientError.invalidState }
+        try checkAdmission()
+        guard state == .disconnected else { throw ManageSieveClientError.invalidState }
         guard !identity.referenceIdentifiers.isEmpty,
               identity.referenceIdentifiers.allSatisfy({ !$0.isEmpty }) else {
             throw ManageSieveClientError.invalidIdentity
         }
-        admittedOperation = true
+        admittedOperation = ManageSieveOperationAdmission()
         state = .connecting
         do {
             let result = try await withTimeout(timeout ?? timeoutPolicy.connect + timeoutPolicy.startTLS) {
                 try await self.performHandshake(identity: identity)
             }
-            admittedOperation = false
+            admittedOperation = nil
             return result
         } catch {
             await closeAfterFailure()
@@ -74,20 +77,21 @@ public actor ManageSieveClient {
     }
 
     public func capability(timeout: Duration? = nil) async throws -> ManageSieveCapabilities {
-        guard (state == .encryptedReady || state == .authenticated), !admittedOperation, capabilities != nil else {
+        try checkAdmission()
+        guard (state == .encryptedReady || state == .authenticated), capabilities != nil else {
             throw ManageSieveClientError.invalidState
         }
-        admittedOperation = true
+        admittedOperation = ManageSieveOperationAdmission()
         do {
             let replacement = try await withTimeout(timeout ?? timeoutPolicy.command) {
                 try await self.refreshCapabilities()
             }
             try ensureOpen()
             self.capabilities = replacement
-            admittedOperation = false
+            admittedOperation = nil
             return replacement
         } catch let error as ManageSieveClientError where error == .serverNo {
-            admittedOperation = false
+            admittedOperation = nil
             throw error
         } catch {
             await closeAfterFailure()
@@ -100,9 +104,8 @@ public actor ManageSieveClient {
         guard !username.contains("\0"), !password.contains("\0") else {
             throw ManageSieveClientError.invalidCredentials
         }
-        admittedOperation = true
+        admittedOperation = ManageSieveOperationAdmission()
         logger.record(.authenticationStarted(mechanism: "PLAIN"))
-        var accepted = false
         do {
             try await withTimeout(timeout ?? timeoutPolicy.authentication) {
                 var payload = ManageSieveAuthentication.plain(username: username, password: password)
@@ -115,11 +118,11 @@ public actor ManageSieveClient {
                 let response = try await self.readResponse()
                 guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
                 try self.requireOK(response)
+                try await self.finishAuthentication()
             }
-            accepted = true
-            try await finishAuthentication(timeout: timeout)
-        } catch let error as ManageSieveClientError where error == .serverNo && !accepted && state == .encryptedReady {
-            admittedOperation = false
+            admittedOperation = nil
+        } catch let error as ManageSieveClientError where error == .serverNo && state == .encryptedReady {
+            admittedOperation = nil
             logger.record(.authenticationRejected)
             throw error
         } catch {
@@ -135,9 +138,8 @@ public actor ManageSieveClient {
               !password.contains("\0"), !password.contains("\r"), !password.contains("\n") else {
             throw ManageSieveClientError.invalidCredentials
         }
-        admittedOperation = true
+        admittedOperation = ManageSieveOperationAdmission()
         logger.record(.authenticationStarted(mechanism: "LOGIN"))
-        var accepted = false
         do {
             try await withTimeout(timeout ?? timeoutPolicy.authentication) {
                 try await self.send("AUTHENTICATE \"LOGIN\"\r\n")
@@ -171,11 +173,11 @@ public actor ManageSieveClient {
                 do { status = try ManageSieveStatusResponse(line: terminal) }
                 catch { throw ManageSieveClientError.parse }
                 try self.requireStatus(status.status)
+                try await self.finishAuthentication()
             }
-            accepted = true
-            try await finishAuthentication(timeout: timeout)
-        } catch let error as ManageSieveClientError where error == .serverNo && !accepted && state == .encryptedReady {
-            admittedOperation = false
+            admittedOperation = nil
+        } catch let error as ManageSieveClientError where error == .serverNo && state == .encryptedReady {
+            admittedOperation = nil
             logger.record(.authenticationRejected)
             throw error
         } catch {
@@ -185,22 +187,25 @@ public actor ManageSieveClient {
     }
 
     private func admitAuthentication(_ mechanism: String) throws {
-        guard state == .encryptedReady, !admittedOperation, let capabilities,
+        try checkAdmission()
+        guard state == .encryptedReady, let capabilities,
               capabilities.isAuthoritative else { throw ManageSieveClientError.invalidState }
         guard capabilities.supportsSASLMechanism(mechanism) else {
             throw ManageSieveClientError.unsupportedMechanism
         }
     }
 
-    private func finishAuthentication(timeout: Duration?) async throws {
-        let replacement = try await withTimeout(timeout ?? timeoutPolicy.authentication) {
-            try await self.refreshCapabilities()
+    private func finishAuthentication() async throws {
+        do {
+            let replacement = try await refreshCapabilities()
+            try ensureOpen()
+            capabilities = replacement
+            state = .authenticated
+            logger.record(.authenticated)
+        } catch {
+            await close()
+            throw sanitized(error)
         }
-        try ensureOpen()
-        capabilities = replacement
-        state = .authenticated
-        admittedOperation = false
-        logger.record(.authenticated)
     }
 
     private func readAuthenticationLine(
@@ -311,8 +316,9 @@ public actor ManageSieveClient {
     }
 
     public func logout(timeout: Duration? = nil) async throws {
-        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
-        admittedOperation = true
+        try checkAdmission()
+        guard state == .authenticated else { throw ManageSieveClientError.invalidState }
+        admittedOperation = ManageSieveOperationAdmission()
         do {
             try await withTimeout(timeout ?? timeoutPolicy.command) {
                 try await self.send("LOGOUT\r\n")
@@ -328,12 +334,14 @@ public actor ManageSieveClient {
     }
 
     private func scriptName(_ name: String, allowEmpty: Bool = false) throws -> Data {
-        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
+        try checkAdmission()
+        guard state == .authenticated else { throw ManageSieveClientError.invalidState }
         return try ManageSieveCommandEncoding.name(name, allowEmpty: allowEmpty, maximumLiteralLength: limits.maximumLiteralLength)
     }
 
     private func validateScript(_ script: Data) throws {
-        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
+        try checkAdmission()
+        guard state == .authenticated else { throw ManageSieveClientError.invalidState }
         guard !script.isEmpty, script.count <= min(limits.maximumLiteralLength, 10 * 1024 * 1024),
               UInt32(exactly: script.count) != nil else { throw ManageSieveClientError.invalidScript }
     }
@@ -366,8 +374,9 @@ public actor ManageSieveClient {
         timeout: Duration?, command: Data,
         interpret: @escaping @Sendable (ManageSieveCommandResponse) throws -> T
     ) async throws -> T {
-        guard state == .authenticated, !admittedOperation else { throw ManageSieveClientError.invalidState }
-        admittedOperation = true
+        try checkAdmission()
+        guard state == .authenticated else { throw ManageSieveClientError.invalidState }
+        admittedOperation = ManageSieveOperationAdmission()
         do {
             let value = try await withTimeout(timeout ?? timeoutPolicy.command) {
                 try await self.sendBytes(command)
@@ -379,10 +388,10 @@ public actor ManageSieveClient {
                 return try interpret(response)
             }
             try ensureOpen()
-            admittedOperation = false
+            admittedOperation = nil
             return value
         } catch let error as ManageSieveClientError where error == .serverNo && state == .authenticated {
-            admittedOperation = false
+            admittedOperation = nil
             throw error
         } catch {
             await closeAfterFailure()
@@ -503,16 +512,16 @@ public actor ManageSieveClient {
 
     private func closeAfterFailure() async {
         await close()
-        admittedOperation = false
+        admittedOperation = nil
     }
 
-    private func closeOnTimeout() {
+    private func closeForTermination() {
         guard state != .closed else { return }
         state = .closed
         capabilities = nil
         let transport = self.transport
         let logger = self.logger
-        // Start closure before reporting the timeout; never wait for a stalled transport operation.
+        // Start closure before reporting termination; never wait for a stalled transport operation.
         Task {
             await transport.close()
             logger.record(.closed)
@@ -521,46 +530,58 @@ public actor ManageSieveClient {
 
     private func sanitized(_ error: Error) -> ManageSieveClientError {
         if let clientError = error as? ManageSieveClientError { return clientError }
-        if error is CancellationError { return .timeout }
+        if error is CancellationError { return .cancelled }
         return .transport
+    }
+
+    private func checkAdmission() throws {
+        guard !Task.isCancelled else { throw ManageSieveClientError.cancelled }
+        guard admittedOperation == nil else { throw ManageSieveClientError.operationInProgress }
+    }
+
+    // The client actor arbitrates every terminal path using the admitted operation's identity.
+    private func claimOperation(_ token: UUID) -> Bool {
+        guard admittedOperation?.id == token, admittedOperation?.settled == false else { return false }
+        admittedOperation?.settled = true
+        return true
+    }
+
+    private func terminateOperation(_ token: UUID, error: ManageSieveClientError) {
+        guard claimOperation(token) else { return }
+        logger.record(error == .timeout ? .timedOut : .cancelled)
+        closeForTermination()
+        admittedOperation?.terminate?(error)
+        admittedOperation?.terminate = nil
     }
 
     private func withTimeout<T: Sendable>(
         _ duration: Duration,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        let gate = ManageSieveTimeoutGate()
-        let operationTask = Task { try await operation() }
+        guard let token = admittedOperation?.id else { throw ManageSieveClientError.invalidState }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                let operationTask = Task { try await operation() }
                 let timeoutTask = Task { [clock] in
-                    do { try await clock.sleep(for: duration) } catch {
-                        if Task.isCancelled { return }
-                    }
-                    guard !Task.isCancelled, await gate.claim() else { return }
-                    closeOnTimeout()
+                    do { try await clock.sleep(for: duration) } catch { return }
+                    guard !Task.isCancelled else { return }
+                    terminateOperation(token, error: .timeout)
+                }
+                admittedOperation?.terminate = { error in
                     operationTask.cancel()
-                    continuation.resume(throwing: ManageSieveClientError.timeout)
+                    timeoutTask.cancel()
+                    continuation.resume(throwing: error)
                 }
                 Task {
                     let result = await operationTask.result
-                    guard await gate.claim() else { return }
+                    guard claimOperation(token) else { return }
+                    admittedOperation?.terminate = nil
                     timeoutTask.cancel()
                     continuation.resume(with: result)
                 }
             }
         } onCancel: {
-            operationTask.cancel()
+            Task { await self.terminateOperation(token, error: .cancelled) }
         }
-    }
-}
-
-private actor ManageSieveTimeoutGate {
-    private var claimed = false
-
-    func claim() -> Bool {
-        guard !claimed else { return false }
-        claimed = true
-        return true
     }
 }

@@ -7,11 +7,17 @@ actor FakeManageSieveTransport: ManageSieveTransport {
         case suspendConnect
         case read(Data)
         case slowRead
+        case suspendRead
+        case suspendWrite(Data)
+        case suspendUpgrade(ManageSieveTLSIdentityRequest)
         case write(Data)
         case upgrade(ManageSieveTLSIdentityRequest)
         case failure
     }
 
+    enum Suspension: Sendable { case read, write, upgrade }
+    private(set) var suspension: Suspension?
+    private var continuation: CheckedContinuation<Data, Error>?
     private var steps: [Step]
     private var connectContinuation: CheckedContinuation<Void, Never>?
     private(set) var writes: [Data] = []
@@ -48,6 +54,8 @@ actor FakeManageSieveTransport: ManageSieveTransport {
         case let .read(data):
             if data.count > maxBytes { violations.append("oversized read") }
             return data
+        case .suspendRead:
+            return try await suspend(.read)
         case .slowRead:
             slowReadStarted = true
             try await Task.sleep(for: .seconds(60))
@@ -57,17 +65,20 @@ actor FakeManageSieveTransport: ManageSieveTransport {
         }
     }
 
-    func write(_ data: Data) throws {
+    func write(_ data: Data) async throws {
         writes.append(data)
-        guard case let .write(expected) = take(), data == expected else {
-            throw FakeError.unexpectedStep
+        switch take() {
+        case let .write(expected) where data == expected: break
+        case let .suspendWrite(expected) where data == expected: _ = try await suspend(.write)
+        default: throw FakeError.unexpectedStep
         }
     }
 
-    func upgradeToTLS(identity: ManageSieveTLSIdentityRequest) throws {
+    func upgradeToTLS(identity: ManageSieveTLSIdentityRequest) async throws {
         upgradeCount += 1
         switch take() {
         case let .upgrade(expected) where expected == identity: break
+        case let .suspendUpgrade(expected) where expected == identity: _ = try await suspend(.upgrade)
         case .failure: throw FakeError.injected
         default: throw FakeError.unexpectedStep
         }
@@ -77,6 +88,19 @@ actor FakeManageSieveTransport: ManageSieveTransport {
         closeCount += 1
         // A real transport must release pending connect/read/write/upgrade operations on close.
         resumeConnect()
+        resumeSuspension(.failure(FakeError.injected))
+    }
+
+    private func suspend(_ stage: Suspension) async throws -> Data {
+        suspension = stage
+        return try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+
+    func resumeSuspension(_ result: Result<Data, Error> = .success(Data())) {
+        let pending = continuation
+        continuation = nil
+        suspension = nil
+        pending?.resume(with: result)
     }
 
     func assertComplete() -> Bool { steps.isEmpty && violations.isEmpty }
@@ -122,5 +146,29 @@ final class RecordingManageSieveLogger: ManageSieveLogger, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return stored
+    }
+}
+
+// Keeps cancelled sleepers until fired to exercise late timer completion deterministically.
+actor ManualManageSieveClock: ManageSieveClock {
+    private var sleepers: [CheckedContinuation<Void, Error>] = []
+    private(set) var durations: [Duration] = []
+
+    func sleep(for duration: Duration) async throws {
+        durations.append(duration)
+        try await withCheckedThrowingContinuation { sleepers.append($0) }
+    }
+
+    var pendingCount: Int { sleepers.count }
+
+    func fireNext() {
+        guard !sleepers.isEmpty else { return }
+        sleepers.removeFirst().resume()
+    }
+
+    func fire() {
+        let pending = sleepers
+        sleepers.removeAll()
+        for sleeper in pending { sleeper.resume() }
     }
 }

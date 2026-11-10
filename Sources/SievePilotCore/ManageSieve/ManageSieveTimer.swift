@@ -1,3 +1,5 @@
+import Foundation
+
 public protocol ManageSieveClock: Sendable {
     func sleep(for duration: Duration) async throws
 }
@@ -14,4 +16,11 @@ public struct ManageSieveTimeoutPolicy: Equatable, Sendable {
         self.authentication = authentication
         self.command = command
     }
+}
+
+// Actor-owned: a late timer or cancellation callback cannot affect a later admission.
+struct ManageSieveOperationAdmission {
+    let id = UUID()
+    var settled = false
+    var terminate: ((ManageSieveClientError) -> Void)?
 }

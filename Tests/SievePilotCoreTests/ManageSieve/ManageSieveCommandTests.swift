@@ -222,15 +222,15 @@ import Testing
         let (slow, active) = try await self.client([.write(Data("LISTSCRIPTS\r\n".utf8)), .slowRead])
         let pending = Task { try await active.listScripts(timeout: .seconds(1)) }
         while !(await slow.slowReadStarted) { await Task.yield() }
-        await expect(.invalidState) { _ = try await active.getScript(name: "x") }
-        await expect(.invalidState) { _ = try await active.checkScript(Data([65])) }
-        await expect(.invalidState) { _ = try await active.putScript(name: "x", script: Data([65])) }
-        await expect(.invalidState) { try await active.setActive(name: "x") }
-        await expect(.invalidState) { try await active.deleteScript(name: "x") }
-        await expect(.invalidState) { try await active.logout() }
-        await expect(.invalidState) { _ = try await active.capability() }
+        await expect(.operationInProgress) { _ = try await active.getScript(name: "x") }
+        await expect(.operationInProgress) { _ = try await active.checkScript(Data([65])) }
+        await expect(.operationInProgress) { _ = try await active.putScript(name: "x", script: Data([65])) }
+        await expect(.operationInProgress) { try await active.setActive(name: "x") }
+        await expect(.operationInProgress) { try await active.deleteScript(name: "x") }
+        await expect(.operationInProgress) { try await active.logout() }
+        await expect(.operationInProgress) { _ = try await active.capability() }
         pending.cancel()
-        await expect(.transport) { _ = try await pending.value }
+        await expect(.cancelled) { _ = try await pending.value }
         #expect(await slow.assertComplete())
     }
 }

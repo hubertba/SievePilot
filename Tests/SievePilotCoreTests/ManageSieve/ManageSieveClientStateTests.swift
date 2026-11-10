@@ -160,8 +160,8 @@ import Testing
         let client = makeClient(transport)
         let first = Task { try await client.connectAndStartTLS(identity: identity) }
         while !(await transport.isConnectSuspended) { await Task.yield() }
-        await expectError(.invalidState) { try await client.connectAndStartTLS(identity: identity) }
-        await expectError(.invalidState) { try await client.capability() }
+        await expectError(.operationInProgress) { try await client.connectAndStartTLS(identity: identity) }
+        await expectError(.operationInProgress) { try await client.capability() }
         await transport.resumeConnect()
         _ = try await first.value
         #expect(await transport.assertComplete())
@@ -218,7 +218,7 @@ import Testing
         try? await Task.sleep(for: .milliseconds(200))
         #expect(await completion.didComplete, "Caller cancellation must not wait for the 1s deadline")
         await pending.value // The RED implementation finishes at its one-second deadline.
-        #expect(await completion.error == .transport)
+        #expect(await completion.error == .cancelled)
         #expect(await client.state == .closed)
         #expect(await client.capabilities == nil)
         #expect(await transport.closeCount == 1)

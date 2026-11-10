@@ -186,7 +186,7 @@ import Testing
         await expectError(.invalidState) { try await client.authenticatePlain(username: username, password: password) }
         let pending = Task { try await client.connectAndStartTLS(identity: identity) }
         while !(await transport.isConnectSuspended) { await Task.yield() }
-        await expectError(.invalidState) { try await client.authenticateLogin(username: username, password: password) }
+        await expectError(.operationInProgress) { try await client.authenticateLogin(username: username, password: password) }
         await transport.resumeConnect()
         _ = try await pending.value
         #expect(await transport.assertComplete())
@@ -213,11 +213,11 @@ import Testing
         _ = try await client.connectAndStartTLS(identity: identity)
         let pending = Task { try await client.authenticatePlain(username: username, password: password, timeout: .seconds(1)) }
         while !(await transport.slowReadStarted) { await Task.yield() }
-        await expectError(.invalidState) { try await client.authenticateLogin(username: username, password: password) }
-        await expectError(.invalidState) { _ = try await client.capability() }
-        await expectError(.invalidState) { try await client.authenticatePlain(username: username, password: password) }
+        await expectError(.operationInProgress) { try await client.authenticateLogin(username: username, password: password) }
+        await expectError(.operationInProgress) { _ = try await client.capability() }
+        await expectError(.operationInProgress) { try await client.authenticatePlain(username: username, password: password) }
         pending.cancel()
-        await expectError(.transport) { try await pending.value }
+        await expectError(.cancelled) { try await pending.value }
         #expect(await client.state == .closed)
         #expect(await transport.assertComplete())
     }
