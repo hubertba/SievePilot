@@ -26,9 +26,11 @@ struct AppDependencies {
     let settingsStore: any AccountConfigurationStoring
     let persistence: any AccountPersistenceCoordinating
     let discovery: any SieveServiceDiscovering
-    let sessionProvider: any ManageSieveSessionProviding
+    let sessionProvider: any ManageSieveCandidateSessionProviding
     let accountService: any SieveAccountServicing
+    let lifecycle: any AppLifecycleObserving
 
+    @MainActor
     static func production() -> AppDependencies {
         let baseDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let settings = AccountConfigurationStore(baseDirectory: baseDirectory)
@@ -39,6 +41,7 @@ struct AppDependencies {
         let manifests = OwnedScriptManifestStore(baseDirectory: baseDirectory)
         let service = SieveAccountService(sessionProvider: sessions, manifestStore: manifests)
         return AppDependencies(settingsStore: settings, persistence: persistence, discovery: discovery,
-                               sessionProvider: sessions, accountService: service)
+                               sessionProvider: sessions, accountService: service,
+                               lifecycle: AppLifecycleCoordinator())
     }
 }

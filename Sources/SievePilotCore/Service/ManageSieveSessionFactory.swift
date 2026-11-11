@@ -17,6 +17,16 @@ public protocol ManageSieveSessionProviding: Sendable {
     ) async throws -> T
 }
 
+/// Opens a session authenticated with a candidate password supplied by the caller
+/// (for example, an unsaved setup form) without reading or writing stored credentials.
+public protocol ManageSieveCandidateSessionProviding: Sendable {
+    func withAuthenticatedSession<T: Sendable>(
+        account: AccountConfiguration,
+        password: Data,
+        _ operation: @Sendable (any AuthenticatedManageSieveSession) async throws -> T
+    ) async throws -> T
+}
+
 public enum ManageSieveSessionFactoryError: Error, Equatable, Sendable {
     case missingCredential
     case invalidCredentialEncoding
@@ -38,7 +48,7 @@ internal protocol ManageSieveClientSession: Sendable {
     func close() async
 }
 
-public struct ManageSieveSessionFactory: ManageSieveSessionProviding, @unchecked Sendable {
+public struct ManageSieveSessionFactory: ManageSieveSessionProviding, ManageSieveCandidateSessionProviding, @unchecked Sendable {
     private let credentialStore: any CredentialStoring
     private let discover: @Sendable (String) async throws -> SieveServiceEndpoint
     private let makeClient: @Sendable (NIOManageSieveTransport.Endpoint) -> any ManageSieveClientSession
@@ -64,6 +74,18 @@ public struct ManageSieveSessionFactory: ManageSieveSessionProviding, @unchecked
             throw ManageSieveSessionFactoryError.missingCredential
         }
         defer { passwordData.resetBytes(in: 0..<passwordData.count) }
+        return try await authenticatedSession(account: account, passwordData: passwordData, operation)
+    }
+
+    public func withAuthenticatedSession<T: Sendable>(account: AccountConfiguration, password: Data,
+        _ operation: @Sendable (any AuthenticatedManageSieveSession) async throws -> T) async throws -> T {
+        var passwordData = password
+        defer { passwordData.resetBytes(in: 0..<passwordData.count) }
+        return try await authenticatedSession(account: account, passwordData: passwordData, operation)
+    }
+
+    private func authenticatedSession<T: Sendable>(account: AccountConfiguration, passwordData: Data,
+        _ operation: @Sendable (any AuthenticatedManageSieveSession) async throws -> T) async throws -> T {
         guard let password = String(data: passwordData, encoding: .utf8) else {
             throw ManageSieveSessionFactoryError.invalidCredentialEncoding
         }

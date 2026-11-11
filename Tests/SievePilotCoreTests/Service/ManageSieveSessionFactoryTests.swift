@@ -155,6 +155,34 @@ final class ManageSieveSessionFactoryTests: XCTestCase {
         XCTAssertEqual(cancelled.closeCount, 1)
     }
 
+    func testCandidatePasswordAuthenticatesWithoutReadingOrWritingStoredCredentials() async throws {
+        let caps = try capabilities(sasl: "PLAIN")
+        let store = FactoryCredentialStore(Data("stored-old".utf8))
+        let client = FactoryClient(caps)
+        let factory = ManageSieveSessionFactory(credentialStore: store, discover: { _ in fatalError() }, makeClient: { _ in client })
+        let value: Int = try await factory.withAuthenticatedSession(
+            account: account(.manual(host: "mail.example.org", port: 4190)), password: Data("candidate".utf8)) { _ in 7 }
+        XCTAssertEqual(value, 7)
+        XCTAssertEqual(client.authentications, ["PLAIN:user:candidate"])
+        XCTAssertEqual(client.logoutCount, 1)
+        XCTAssertEqual(client.closeCount, 1)
+        let stored = try await store.read(accountID: accountID)
+        XCTAssertEqual(stored, Data("stored-old".utf8))
+
+        let first = FactoryClient(caps)
+        let empty = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(nil), discover: { _ in fatalError() }, makeClient: { _ in first })
+        _ = try await empty.withAuthenticatedSession(
+            account: account(.manual(host: "mail.example.org", port: 4190)), password: Data("candidate".utf8)) { _ in 1 }
+        XCTAssertEqual(first.authentications, ["PLAIN:user:candidate"])
+
+        let invalid = ManageSieveSessionFactory(credentialStore: store, discover: { _ in fatalError() }, makeClient: { _ in FactoryClient(caps) })
+        do {
+            _ = try await invalid.withAuthenticatedSession(
+                account: account(.manual(host: "mail.example.org", port: 4190)), password: Data([0xff])) { _ in 1 }
+            XCTFail()
+        } catch { XCTAssertEqual(error as? ManageSieveSessionFactoryError, .invalidCredentialEncoding) }
+    }
+
     func testConnectionAndAuthenticationFailuresRemainClassifiedAndClose() async throws {
         let caps = try capabilities(sasl: "PLAIN")
         for (connectError, authError) in [(ManageSieveClientError.tlsIdentityFailed as Error?, nil), (nil, ManageSieveClientError.serverNo as Error?)] {

@@ -22,126 +22,214 @@ final class AppModel: ObservableObject {
     @Published private(set) var verifiedSnapshot: VerifiedAccountSnapshot?
     @Published var userFacingError: String?
 
+    private enum Operation {
+        case load, testAndSave, refresh, delete
+
+        var state: OperationState {
+            switch self {
+            case .load, .delete: return .loading
+            case .testAndSave: return .testing
+            case .refresh: return .refreshing
+            }
+        }
+
+        /// Operations that read or mutate persisted state; resign-active must not invalidate them.
+        var isCritical: Bool { self != .refresh }
+    }
+
+    private enum SetupFormError: Error { case missingPassword }
+
     private let settingsStore: any AccountConfigurationStoring
     private let persistence: any AccountPersistenceCoordinating
     private let discovery: any SieveServiceDiscovering
-    private let sessionProvider: any ManageSieveSessionProviding
+    private let sessionProvider: any ManageSieveCandidateSessionProviding
     private let accountService: any SieveAccountServicing
+    private let lifecycle: (any AppLifecycleObserving)?
+    // Reserved for Task 7 (expiry and wake scheduling).
     private let now: @Sendable () -> Date
+    private let calendar: Calendar
+    private let timeZone: TimeZone
     private var generation = 0
+    private var operationTask: Task<Void, Never>?
+    private var activeOperation: Operation?
+    private var commitTask: Task<Void, Error>?
 
     init(settingsStore: any AccountConfigurationStoring,
          persistence: any AccountPersistenceCoordinating,
          discovery: any SieveServiceDiscovering,
-         sessionProvider: any ManageSieveSessionProviding,
+         sessionProvider: any ManageSieveCandidateSessionProviding,
          accountService: any SieveAccountServicing,
-         now: @escaping @Sendable () -> Date = Date.init) {
+         now: @escaping @Sendable () -> Date = { Date() },
+         calendar: Calendar = .current,
+         timeZone: TimeZone = .current,
+         lifecycle: (any AppLifecycleObserving)? = nil) {
         self.settingsStore = settingsStore
         self.persistence = persistence
         self.discovery = discovery
         self.sessionProvider = sessionProvider
         self.accountService = accountService
         self.now = now
+        self.calendar = calendar
+        self.timeZone = timeZone
+        self.lifecycle = lifecycle
+        lifecycle?.start { [weak self] event in
+            guard let self else { return }
+            if event == .didResignActive { self.markStale() }
+            else { Task { await self.handle(event) } }
+        }
     }
 
     convenience init(dependencies: AppDependencies) {
         self.init(settingsStore: dependencies.settingsStore, persistence: dependencies.persistence,
                   discovery: dependencies.discovery, sessionProvider: dependencies.sessionProvider,
-                  accountService: dependencies.accountService)
+                  accountService: dependencies.accountService, lifecycle: dependencies.lifecycle)
     }
 
     func load() async {
-        let token = begin(.loading)
-        do {
-            let account = try await settingsStore.load()
-            guard isCurrent(token) else { return }
-            persistedAccount = account
-            verifiedSnapshot = nil
-            if let account { populateForm(from: account); operationState = .stale }
-            else { operationState = .idle }
-        } catch is CancellationError {
-            finishCancellation(token)
-        } catch {
-            finishFailure(token, message: "Unable to load the saved account.")
+        await run(.load) { [self] token in
+            do {
+                let account = try await settingsStore.load()
+                guard isCurrent(token) else { return }
+                persistedAccount = account
+                verifiedSnapshot = nil
+                if let account { populateForm(from: account); operationState = .stale }
+                else { operationState = .idle }
+            } catch is CancellationError {
+                finishCancellation(token)
+            } catch {
+                finishFailure(token, message: "Unable to load the saved account.")
+            }
         }
     }
 
     func testAndSave() async {
-        let token = begin(.testing)
-        do {
-            let configuration = try configurationFromForm()
-            if usesAutomaticDiscovery {
-                let endpoint = try await discovery.discover(emailAddress: configuration.emailAddress)
+        await run(.testAndSave) { [self] token in
+            do {
+                let configuration = try configurationFromForm()
+                guard !password.isEmpty else { throw SetupFormError.missingPassword }
+                let candidate = Data(password.utf8)
+                if usesAutomaticDiscovery {
+                    let endpoint = try await discovery.discover(emailAddress: configuration.emailAddress)
+                    guard isCurrent(token) else { return }
+                    discoveryPreview = "\(endpoint.host):\(endpoint.port)"
+                } else {
+                    discoveryPreview = nil
+                }
+                // Authenticate with the candidate form password; nothing is persisted until this succeeds.
+                _ = try await sessionProvider.withAuthenticatedSession(account: configuration,
+                                                                       password: candidate) { _ in true }
                 guard isCurrent(token) else { return }
-                discoveryPreview = "\(endpoint.host):\(endpoint.port)"
-            } else {
-                discoveryPreview = nil
+                guard !Task.isCancelled else { throw CancellationError() }
+                let persistence = persistence
+                try await commit { try await persistence.save(configuration: configuration, password: candidate) }
+                // The mutation is durable: reflect it even if a newer operation superseded this one.
+                persistedAccount = configuration
+                verifiedSnapshot = nil
+                if isCurrent(token) {
+                    password = ""
+                    userFacingError = nil
+                    operationState = .stale
+                }
+            } catch is CancellationError {
+                finishCancellation(token)
+            } catch is AccountConfigurationError {
+                finishFailure(token, message: "Enter a valid email address, username, and server configuration.")
+            } catch SetupFormError.missingPassword {
+                finishFailure(token, message: "Enter your password.")
+            } catch {
+                finishFailure(token, message: "Unable to verify and save this account.")
             }
-            _ = try await sessionProvider.withAuthenticatedSession(account: configuration) { _ in true }
-            guard isCurrent(token) else { return }
-            try await persistence.save(configuration: configuration, password: Data(password.utf8))
-            guard isCurrent(token) else { return }
-            persistedAccount = configuration
-            password = ""
-            verifiedSnapshot = nil
-            userFacingError = nil
-            operationState = .stale
-        } catch is CancellationError {
-            finishCancellation(token)
-        } catch is AccountConfigurationError {
-            finishFailure(token, message: "Enter a valid email address, username, and server configuration.")
-        } catch {
-            finishFailure(token, message: "Unable to verify and save this account.")
         }
     }
 
     func refresh() async {
         guard let account = persistedAccount else { return }
-        let token = begin(.refreshing)
-        do {
-            let snapshot = try await accountService.refresh(account: account)
-            guard isCurrent(token) else { return }
-            verifiedSnapshot = snapshot
-            userFacingError = nil
-            operationState = .verified
-        } catch is CancellationError {
-            finishCancellation(token)
-        } catch {
-            finishFailure(token, message: "Unable to verify the server state.")
+        guard activeOperation?.isCritical != true else { return }
+        await run(.refresh) { [self] token in
+            do {
+                let snapshot = try await accountService.refresh(account: account)
+                guard isCurrent(token) else { return }
+                verifiedSnapshot = snapshot
+                userFacingError = nil
+                operationState = .verified
+            } catch is CancellationError {
+                finishCancellation(token)
+            } catch {
+                finishFailure(token, message: "Unable to verify the server state.")
+            }
         }
     }
 
     func deleteAccount() async {
         guard let account = persistedAccount else { return }
-        let token = begin(.loading)
-        do {
-            try await persistence.delete(accountID: account.accountID)
-            guard isCurrent(token) else { return }
-            persistedAccount = nil
-            verifiedSnapshot = nil
-            discoveryPreview = nil
-            password = ""
-            userFacingError = nil
-            operationState = .idle
-        } catch is CancellationError {
-            finishCancellation(token)
-        } catch {
-            finishFailure(token, message: "Unable to delete this account.")
+        await run(.delete) { [self] token in
+            do {
+                let persistence = persistence
+                try await commit { try await persistence.delete(accountID: account.accountID) }
+                persistedAccount = nil
+                verifiedSnapshot = nil
+                discoveryPreview = nil
+                if isCurrent(token) {
+                    password = ""
+                    userFacingError = nil
+                    operationState = .idle
+                }
+            } catch is CancellationError {
+                finishCancellation(token)
+            } catch {
+                finishFailure(token, message: "Unable to delete this account.")
+            }
         }
     }
 
+    func handle(_ event: AppLifecycleEvent) async {
+        switch event {
+        case .didResignActive: markStale()
+        case .didBecomeActive: await refresh()
+        }
+    }
+
+    /// Invalidates only a verification in flight. Loads and persistence mutations are never dropped here.
     func markStale() {
+        guard activeOperation?.isCritical != true else { return }
+        operationTask?.cancel()
+        operationTask = nil
+        activeOperation = nil
         generation += 1
         if persistedAccount != nil { operationState = .stale }
     }
 
     func dismissError() { userFacingError = nil }
 
-    private func begin(_ state: OperationState) -> Int {
+    private func run(_ operation: Operation,
+                     _ body: @escaping @MainActor @Sendable (Int) async -> Void) async {
+        operationTask?.cancel()
         generation += 1
+        let token = generation
         userFacingError = nil
-        operationState = state
-        return generation
+        operationState = operation.state
+        activeOperation = operation
+        let pendingCommit = commitTask
+        let task = Task { @MainActor [weak self] in
+            // A superseded operation may be mid-commit; let it land before reading state again.
+            _ = await pendingCommit?.result
+            guard let self else { return }
+            if Task.isCancelled { finishCancellation(token) } else { await body(token) }
+            if isCurrent(token) {
+                activeOperation = nil
+                operationTask = nil
+            }
+        }
+        operationTask = task
+        await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+    }
+
+    /// Runs a persistence mutation outside the caller's cancellation so Keychain/settings stay consistent.
+    private func commit(_ work: @escaping @Sendable () async throws -> Void) async throws {
+        let task = Task { try await work() }
+        commitTask = task
+        defer { if commitTask == task { commitTask = nil } }
+        try await task.value
     }
 
     private func isCurrent(_ token: Int) -> Bool { generation == token }
