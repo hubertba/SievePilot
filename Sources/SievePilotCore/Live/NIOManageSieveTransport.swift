@@ -430,7 +430,7 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
         for (waiter, data) in ready { waiter.resume(returning: data) }
     }
 
-    private final class InboundHandler: ChannelInboundHandler {
+    internal final class InboundHandler: ChannelInboundHandler {
         typealias InboundIn = ByteBuffer
         private let owner: NIOManageSieveTransport
         // Event-loop confined; captured before insertion and restored only after verification + Finished.
@@ -451,7 +451,7 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
             context.fireUserInboundEventTriggered(event)
         }
         func errorCaught(context: ChannelHandlerContext, error: Error) {
-            owner.failTLS(.tlsHandshakeFailed)
+            owner.endOfStream()
             context.close(promise: nil)
         }
     }

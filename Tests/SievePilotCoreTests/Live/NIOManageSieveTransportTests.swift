@@ -1,5 +1,6 @@
 import Foundation
 import NIOCore
+import NIOEmbedded
 import NIOPosix
 import NIOSSL
 import XCTest
@@ -81,6 +82,55 @@ final class NIOManageSieveTransportTests: XCTestCase {
         XCTAssertEqual(eof, Data())
         await transport.close()
         await transport.close()
+        try await listener.close().get()
+        await shutdown(group)
+    }
+
+    private func injectChannelError(into transport: NIOManageSieveTransport) throws {
+        // Drive the real inbound handler without relying on OS-specific socket error delivery.
+        let channel = EmbeddedChannel(handler: NIOManageSieveTransport.InboundHandler(owner: transport))
+        channel.pipeline.fireErrorCaught(NSError(domain: "private-socket-detail", code: 1))
+        XCTAssertFalse(channel.isActive)
+        XCTAssertTrue(try channel.finish(acceptAlreadyClosed: true).isClean)
+    }
+
+    func testPlaintextChannelErrorPreservesEOFAndSanitizedCloseInsteadOfTLSFailure() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let listener = try server(group: group, recorder: ServerRecorder())
+        let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group)
+        try await transport.connect()
+
+        try injectChannelError(into: transport)
+        do {
+            let eof = try await transport.read(maxBytes: 1)
+            XCTAssertEqual(eof, Data())
+        } catch { XCTFail("Plaintext channel errors must preserve EOF, not fail with \(error)") }
+        await transport.close()
+        await transport.close()
+        do { _ = try await transport.read(maxBytes: 1); XCTFail("Expected closed") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .closed) }
+        do { try await transport.write(Data("secret".utf8)); XCTFail("Expected closed") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .closed) }
+        try await listener.close().get()
+        await shutdown(group)
+    }
+
+    func testChannelErrorDuringActiveTLSUpgradeRemainsHandshakeFailure() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let recorder = ServerRecorder()
+        let listener = try server(group: group, recorder: recorder)
+        let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group)
+        try await transport.connect()
+        let pending = Task { try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("source.example.org")])) }
+        await waitUntil { !recorder.bytes.isEmpty }
+
+        try injectChannelError(into: transport)
+        do { try await pending.value; XCTFail("Expected handshake failure") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .tlsHandshakeFailed) }
+        await transport.close()
+        await transport.close()
+        do { try await transport.write(Data("secret".utf8)); XCTFail("Expected terminal failure") }
+        catch { XCTAssertEqual(error as? NIOTransportError, .tlsHandshakeFailed) }
         try await listener.close().get()
         await shutdown(group)
     }

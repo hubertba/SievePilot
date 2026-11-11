@@ -30,7 +30,10 @@ let package = Package(
         ]),
         .testTarget(
             name: "SievePilotCoreTests",
-            dependencies: ["SievePilotCore"],
+            dependencies: [
+                "SievePilotCore",
+                .product(name: "NIOEmbedded", package: "swift-nio")
+            ],
             resources: [.process("Fixtures")]
         )
     ]
