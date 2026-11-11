@@ -16,12 +16,16 @@ private final class FactoryClient: ManageSieveClientSession, @unchecked Sendable
     var connectError: Error?
     var plainError: Error?
     var loginError: Error?
+    var postAuthenticationCapabilities: ManageSieveCapabilities?
     private(set) var identities: [ManageSieveTLSIdentityRequest] = []
     private(set) var authentications: [String] = []
     private(set) var logoutCount = 0
     private(set) var closeCount = 0
 
-    init(_ advertised: ManageSieveCapabilities) { self.advertised = advertised }
+    init(_ advertised: ManageSieveCapabilities) {
+        self.advertised = advertised
+        postAuthenticationCapabilities = advertised
+    }
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     func connectAndStartTLS(identity: ManageSieveTLSIdentityRequest, timeout: Duration?) async throws -> ManageSieveCapabilities {
         let error = locked { identities.append(identity); return connectError }
@@ -36,7 +40,7 @@ private final class FactoryClient: ManageSieveClientSession, @unchecked Sendable
         let error = locked { authentications.append("LOGIN:\(username):\(password)"); return loginError }
         if let error { throw error }
     }
-    var capabilities: ManageSieveCapabilities? { get async { advertised } }
+    var capabilities: ManageSieveCapabilities? { get async { postAuthenticationCapabilities } }
     func listScripts(timeout: Duration?) async throws -> [ManageSieveScriptEntry] { [] }
     func getScript(name: String, timeout: Duration?) async throws -> Data { Data() }
     func checkScript(_ script: Data, timeout: Duration?) async throws -> ManageSieveCommandResult { .init(responseCode: nil, message: nil) }
@@ -129,6 +133,26 @@ final class ManageSieveSessionFactoryTests: XCTestCase {
         do { _ = try await unsupported.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in 1 }; XCTFail() }
         catch { XCTAssertEqual(error as? ManageSieveSessionFactoryError, .unsupportedAuthentication) }
         XCTAssertEqual(unsupportedClient.closeCount, 1)
+    }
+
+    func testInvalidCredentialPostAuthenticationCapabilityFailureAndCancellationCleanup() async throws {
+        let caps = try capabilities(sasl: "PLAIN")
+        let invalid = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data([0xff])), discover: { _ in fatalError() }, makeClient: { _ in FactoryClient(caps) })
+        do { _ = try await invalid.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in 1 }; XCTFail() }
+        catch { XCTAssertEqual(error as? ManageSieveSessionFactoryError, .invalidCredentialEncoding) }
+
+        let changed = FactoryClient(caps); changed.postAuthenticationCapabilities = nil
+        let changedFactory = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data("password".utf8)), discover: { _ in fatalError() }, makeClient: { _ in changed })
+        do { _ = try await changedFactory.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in 1 }; XCTFail() }
+        catch { XCTAssertEqual(error as? ManageSieveClientError, .parse) }
+        XCTAssertEqual(changed.closeCount, 1)
+
+        let cancelled = FactoryClient(caps)
+        let cancelledFactory = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data("password".utf8)), discover: { _ in fatalError() }, makeClient: { _ in cancelled })
+        do { _ = try await cancelledFactory.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in throw CancellationError() } as Int; XCTFail() }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(cancelled.logoutCount, 1)
+        XCTAssertEqual(cancelled.closeCount, 1)
     }
 
     func testConnectionAndAuthenticationFailuresRemainClassifiedAndClose() async throws {

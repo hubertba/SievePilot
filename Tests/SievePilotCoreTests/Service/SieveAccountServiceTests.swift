@@ -11,6 +11,7 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
     var conflictOnSecondList: (String, Data)?
     var setActiveError: Error?
     var putError: Error?
+    var corruptReadBack = false
 
     init(capabilities: ManageSieveCapabilities, scripts: [String: Data] = [:], active: String? = nil) {
         self.capabilities = capabilities; self.scripts = scripts; self.active = active
@@ -24,7 +25,9 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
         return scripts.keys.sorted().map { .init(name: $0, isActive: $0 == active) }
     }
     func getScript(name: String, timeout: Duration?) async throws -> Data {
-        events.append("get:\(name)"); return scripts[name] ?? Data()
+        events.append("get:\(name)")
+        if corruptReadBack, name == active, events.contains("active:\(name)") { return Data("corrupt".utf8) }
+        return scripts[name] ?? Data()
     }
     func checkScript(_ script: Data, timeout: Duration?) async throws -> ManageSieveCommandResult {
         events.append("check"); return .init(responseCode: nil, message: nil)
@@ -61,9 +64,11 @@ private final class DrawSource: @unchecked Sendable {
 
 private actor MemoryManifestStore: OwnedScriptManifestStoring {
     var records: [OwnedScriptManifestRecord] = []
+    var savedPhases: [OwnedScriptManifestPhase] = []
     var failPhase: OwnedScriptManifestPhase?
     func load(accountID: AccountID) async throws -> [OwnedScriptManifestRecord] { records.filter { $0.accountID == accountID } }
     func save(_ record: OwnedScriptManifestRecord) async throws {
+        savedPhases.append(record.phase)
         if record.phase == failPhase { throw CocoaError(.fileWriteUnknown) }
         records.removeAll { $0.accountID == record.accountID && $0.name == record.name }
         records.append(record)
@@ -90,6 +95,13 @@ final class SieveAccountServiceTests: XCTestCase {
                                  endpointPolicy: .automatic(sourceDomain: "example.org"), tlsPolicy: .startTLS)
     }
 
+    private func temporaryDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("SievePilot-manifest-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
     private func configuration() throws -> OutOfOfficeConfiguration {
         try OutOfOfficeConfiguration(emailAddress: "user@example.org", subject: "Away", message: "Back soon",
                                      expiry: .init(instant: now.addingTimeInterval(3600), timeZoneIdentifier: "UTC", utcOffsetSeconds: 0))
@@ -101,6 +113,41 @@ final class SieveAccountServiceTests: XCTestCase {
         return SieveAccountService(sessionProvider: ServiceProvider(session: session), manifestStore: manifests,
                                    now: { fixedNow }, randomBytes: random,
                                    makeUUID: { UUID(uuidString: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE")! })
+    }
+
+    func testManifestFileStoreIsVersionedPrivateAndNeverReportsFailureAfterCommit() async throws {
+        let base = try temporaryDirectory()
+        let record = OwnedScriptManifestRecord(accountID: accountID, name: "owned", sha256: String(repeating: "a", count: 64),
+            predecessorName: "base", predecessorSHA256: String(repeating: "b", count: 64), phase: .prepared, createdAt: now)
+        let store = OwnedScriptManifestStore(baseDirectory: base)
+        try await store.save(record)
+        let initialRecords = try await store.load(accountID: accountID)
+        XCTAssertEqual(initialRecords, [record])
+        let directoryMode = (try FileManager.default.attributesOfItem(atPath: store.directoryURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        let fileMode = (try FileManager.default.attributesOfItem(atPath: store.fileURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        XCTAssertEqual(directoryMode.map { $0 & 0o777 }, 0o700)
+        XCTAssertEqual(fileMode.map { $0 & 0o777 }, 0o600)
+        let previous = try Data(contentsOf: store.fileURL)
+
+        let failedReplace = OwnedScriptManifestStore(baseDirectory: base, replace: { _, _ in throw CocoaError(.fileWriteUnknown) })
+        do { try await failedReplace.save(record.withPhase(.uploaded)); XCTFail() } catch { }
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), previous)
+
+        var attributeCalls = 0
+        let noPostCommit = OwnedScriptManifestStore(baseDirectory: base, replace: OwnedScriptManifestStore.atomicReplace,
+            setAttributes: { attributes, path in
+                attributeCalls += 1
+                if attributeCalls == 3 { throw CocoaError(.fileWriteNoPermission) }
+                try FileManager.default.setAttributes(attributes, ofItemAtPath: path)
+            })
+        try await noPostCommit.save(record.withPhase(.uploaded))
+        XCTAssertEqual(attributeCalls, 2)
+        let uploadedRecords = try await store.load(accountID: accountID)
+        XCTAssertEqual(uploadedRecords.first?.phase, .uploaded)
+
+        try Data("{\"version\":2,\"records\":[]}".utf8).write(to: store.fileURL)
+        do { _ = try await store.load(accountID: accountID); XCTFail() }
+        catch { XCTAssertTrue(error is OwnedScriptManifestStore.ManifestStoreError) }
     }
 
     func testRefreshNoActiveBinaryMalformedOwnershipAndTimestampAfterVerification() async throws {
@@ -121,6 +168,23 @@ final class SieveAccountServiceTests: XCTestCase {
         let mismatch = ServiceSession(capabilities: try capabilities(), scripts: ["owned": owned], active: "owned")
         let mismatchSnapshot = try await service(mismatch).refresh(account: account())
         XCTAssertEqual(mismatchSnapshot.outOfOfficeState, .malformed(reason: "accountIDMismatch"))
+    }
+
+    func testRefreshVerifiesOnExpiredAndMalformedManagedScripts() async throws {
+        let metadata = try ManagedScriptMetadata(accountID: accountID, versionID: UUID(), predecessorSHA256: nil)
+        let onBytes = try SieveScriptPatcher.apply(.enable(configuration()), to: Data(), metadata: metadata, accountID: accountID)
+        let on = ServiceSession(capabilities: try capabilities(), scripts: ["on": onBytes], active: "on")
+        guard case .on = try await service(on).refresh(account: account()).outOfOfficeState else { return XCTFail() }
+
+        let expiredConfiguration = try OutOfOfficeConfiguration(emailAddress: "user@example.org", subject: nil, message: "Expired",
+            expiry: .init(instant: now.addingTimeInterval(-1), timeZoneIdentifier: "UTC", utcOffsetSeconds: 0))
+        let expiredBytes = try SieveScriptPatcher.apply(.enable(expiredConfiguration), to: Data(), metadata: metadata, accountID: accountID)
+        let expired = ServiceSession(capabilities: try capabilities(), scripts: ["expired": expiredBytes], active: "expired")
+        guard case .expiryPassedServerClockApplies = try await service(expired).refresh(account: account()).outOfOfficeState else { return XCTFail() }
+
+        let malformedBytes = Data("# BEGIN SIEVEPILOT METADATA v1\ninvalid\n".utf8)
+        let malformed = ServiceSession(capabilities: try capabilities(), scripts: ["bad": malformedBytes], active: "bad")
+        guard case .malformed = try await service(malformed).refresh(account: account()).outOfOfficeState else { return XCTFail() }
     }
 
     func testRefreshRejectsUnsupportedRequiredSieveExtensions() async throws {
@@ -152,7 +216,7 @@ final class SieveAccountServiceTests: XCTestCase {
     func testMutationConflictStopsBeforeActivationAndCheckScriptIsOptional() async throws {
         let baseline = Data("keep;\n".utf8)
         let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
-        await session.setConflictOnSecondList(name: "other", script: Data("changed".utf8))
+        await session.setConflictOnSecondList(name: "base", script: Data("changed".utf8))
         let outcome = try await service(session).applyOutOfOffice(account: account(), configuration: configuration())
         XCTAssertEqual(outcome, .conflict)
         let events = await session.events
@@ -162,10 +226,16 @@ final class SieveAccountServiceTests: XCTestCase {
 
     func testAmbiguousActivationAndManifestFailureAfterActivationReturnUnknown() async throws {
         let baseline = Data("keep;\n".utf8)
-        let interrupted = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
-        await interrupted.setSetActiveError(ManageSieveClientError.transport)
-        let interruptedOutcome = try await service(interrupted).applyOutOfOffice(account: account(), configuration: configuration())
-        XCTAssertEqual(interruptedOutcome, .unknown)
+        for error in [ManageSieveClientError.transport, .parse] {
+            let interrupted = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
+            await interrupted.setSetActiveError(error)
+            let interruptedOutcome = try await service(interrupted).applyOutOfOffice(account: account(), configuration: configuration())
+            XCTAssertEqual(interruptedOutcome, .unknown)
+        }
+        let rejected = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
+        await rejected.setSetActiveError(ManageSieveClientError.serverNo)
+        do { _ = try await service(rejected).applyOutOfOffice(account: account(), configuration: configuration()); XCTFail() }
+        catch { XCTAssertEqual(error as? ManageSieveClientError, .serverNo) }
 
         let manifests = MemoryManifestStore(); await manifests.setFailPhase(.verifiedActive)
         let activated = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
@@ -173,6 +243,27 @@ final class SieveAccountServiceTests: XCTestCase {
         XCTAssertEqual(manifestOutcome, .unknown)
         let records = await manifests.records
         XCTAssertEqual(records.map(\.phase), [.uploaded])
+    }
+
+    func testReadBackMismatchAndPreparedOrUploadedManifestFailuresAreSafe() async throws {
+        let baseline = Data("keep;\n".utf8)
+        let mismatch = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
+        await mismatch.setCorruptReadBack(true)
+        let mismatchOutcome = try await service(mismatch).applyOutOfOffice(account: account(), configuration: configuration())
+        XCTAssertEqual(mismatchOutcome, .unknown)
+
+        for phase in [OwnedScriptManifestPhase.prepared, .uploaded] {
+            let manifests = MemoryManifestStore(); await manifests.setFailPhase(phase)
+            let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
+            do {
+                let outcome = try await service(session, manifests: manifests).applyOutOfOffice(account: account(), configuration: configuration())
+                XCTAssertEqual(phase, .uploaded); XCTAssertEqual(outcome, .unknown)
+            } catch {
+                XCTAssertEqual(phase, .prepared); XCTAssertEqual(error as? SieveAccountServiceError, .manifest)
+            }
+            let phases = await manifests.savedPhases
+            XCTAssertTrue(phases.contains(phase))
+        }
     }
 
     func testPutServerNoPropagatesAndLeavesPreparedRollbackRecord() async throws {
@@ -190,6 +281,7 @@ private extension ServiceSession {
     func setConflictOnSecondList(name: String, script: Data) { conflictOnSecondList = (name, script) }
     func setSetActiveError(_ error: Error?) { setActiveError = error }
     func setPutError(_ error: Error?) { putError = error }
+    func setCorruptReadBack(_ value: Bool) { corruptReadBack = value }
 }
 
 private extension MemoryManifestStore {

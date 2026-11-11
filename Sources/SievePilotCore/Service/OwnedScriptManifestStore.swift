@@ -1,10 +1,35 @@
+import Darwin
 import Foundation
 
 public actor OwnedScriptManifestStore: OwnedScriptManifestStoring {
-    private let fileURL: URL
+    internal nonisolated let directoryURL: URL
+    internal nonisolated let fileURL: URL
+    private let replace: (URL, URL) throws -> Void
+    private let setAttributes: ([FileAttributeKey: Any], String) throws -> Void
 
     public init(baseDirectory: URL) {
-        fileURL = baseDirectory.appendingPathComponent("SievePilot/owned-scripts.json")
+        self.init(baseDirectory: baseDirectory, replace: Self.atomicReplace)
+    }
+
+    internal init(baseDirectory: URL, replace: @escaping (URL, URL) throws -> Void) {
+        self.init(baseDirectory: baseDirectory, replace: replace) { attributes, path in
+            try FileManager.default.setAttributes(attributes, ofItemAtPath: path)
+        }
+    }
+
+    internal init(baseDirectory: URL, replace: @escaping (URL, URL) throws -> Void,
+                  setAttributes: @escaping ([FileAttributeKey: Any], String) throws -> Void) {
+        directoryURL = baseDirectory.appendingPathComponent("SievePilot", isDirectory: true)
+        fileURL = directoryURL.appendingPathComponent("owned-scripts.json")
+        self.replace = replace
+        self.setAttributes = setAttributes
+    }
+
+    internal static func atomicReplace(_ temporary: URL, _ destination: URL) throws {
+        let result = temporary.path.withCString { source in
+            destination.path.withCString { target in Darwin.rename(source, target) }
+        }
+        guard result == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
     }
 
     public func load(accountID: AccountID) async throws -> [OwnedScriptManifestRecord] {
@@ -23,14 +48,19 @@ public actor OwnedScriptManifestStore: OwnedScriptManifestStoring {
         }
         records.removeAll { $0.accountID == record.accountID && $0.name == record.name }
         records.append(record)
-        let directory = fileURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+
+        let manager = FileManager.default
+        try manager.createDirectory(at: directoryURL, withIntermediateDirectories: true,
+                                    attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+        try setAttributes([.posixPermissions: NSNumber(value: Int16(0o700))], directoryURL.path)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(Envelope(version: 1, records: records))
-        try data.write(to: fileURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o600))],
-                                              ofItemAtPath: fileURL.path)
+        let temporary = directoryURL.appendingPathComponent(".owned-scripts-\(UUID().uuidString).tmp")
+        defer { try? manager.removeItem(at: temporary) }
+        try data.write(to: temporary, options: .withoutOverwriting)
+        try setAttributes([.posixPermissions: NSNumber(value: Int16(0o600))], temporary.path)
+        // Atomic rename is the final fallible operation, so a thrown save never follows a commit.
+        try replace(temporary, fileURL)
     }
 
     private struct Envelope: Codable { let version: Int; let records: [OwnedScriptManifestRecord] }

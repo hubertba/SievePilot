@@ -180,7 +180,7 @@ public actor SieveAccountService {
         if error is CancellationError { return true }
         guard let error = error as? ManageSieveClientError else { return false }
         return [.cancelled, .transport, .tls, .tlsTrustFailed, .tlsIdentityFailed, .timeout,
-                .unexpectedEOF, .serverBye].contains(error)
+                .unexpectedEOF, .parse, .serverBye].contains(error)
     }
 
     private static func secureRandomBytes() -> Data {
