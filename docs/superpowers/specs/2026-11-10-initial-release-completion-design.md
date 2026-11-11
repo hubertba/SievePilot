@@ -54,7 +54,7 @@ Add SwiftNIO and NIOSSL package products to `SievePilotCore`. `NIOManageSieveTra
 - `connect()` creates one `ClientBootstrap` TCP channel.
 - `read(maxBytes:)` drains a bounded actor-owned inbound queue and suspends when empty.
 - `write(_:)` writes and flushes one `ByteBuffer` and resumes only after completion.
-- `upgradeToTLS(identity:)` inserts `NIOSSLClientHandler` into the existing channel pipeline, waits for the handshake, then performs explicit service-identity validation.
+- The protocol client reads the short STARTTLS terminal response with one-byte transport reads so any coalesced TLS bytes remain as an exact unread suffix inside the transport. `upgradeToTLS(identity:)` inserts `NIOSSLClientHandler` into the existing channel pipeline, replays that suffix through TLS, waits for the handshake, then performs explicit trust and service-identity validation.
 - `close()` is idempotent, closes the channel/event-loop resources owned by the transport, and resumes all pending reads/writes with a closed error.
 
 The transport must not log inbound or outbound bytes. Its errors expose categories and bounded technical metadata only.

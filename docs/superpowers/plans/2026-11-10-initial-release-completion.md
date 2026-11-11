@@ -95,8 +95,11 @@ git commit -m "feat: add live ManageSieve TCP transport"
 **Files:**
 - Create: `Sources/SievePilotCore/Live/ManageSieveTLSIdentityValidator.swift`
 - Modify: `Sources/SievePilotCore/Live/NIOManageSieveTransport.swift`
+- Modify: `Sources/SievePilotCore/ManageSieve/ManageSieveClient.swift`
 - Create: `Tests/SievePilotCoreTests/Live/ManageSieveTLSIdentityValidatorTests.swift`
 - Modify: `Tests/SievePilotCoreTests/Live/NIOManageSieveTransportTests.swift`
+- Modify: `Tests/SievePilotCoreTests/ManageSieve/FakeManageSieveTransport.swift`
+- Modify: `Tests/SievePilotCoreTests/ManageSieve/ManageSieveClientStateTests.swift`
 - Add fixtures: `Tests/SievePilotCoreTests/Fixtures/TLS/*`
 
 **Interfaces:**
@@ -134,15 +137,15 @@ Expected: FAIL on missing validator/types.
 
 - [ ] **Step 3: Implement chain and SAN validation**
 
-Use Security.framework `SecTrust` evaluation for the production macOS system chain trust decision. Use Swift Certificates only for deterministic fixture-chain tests and SAN parsing/matching. Match DNS-ID and SRV-ID (`otherName` OID `1.3.6.1.5.5.7.8.7`) explicitly; the connection target is never added to identifiers implicitly. Keep public TLS errors sanitized but distinguish chain-trust from service-identity failure.
+Use Security.framework `SecTrust` evaluation with an SSL-server policy that has no hostname for the production macOS system chain trust decision; the discovered connection target must never become a trusted identity implicitly. Use Swift Certificates only for deterministic fixture-chain tests and SAN parsing/matching. Match DNS-ID and SRV-ID (`otherName` OID `1.3.6.1.5.5.7.8.7`) explicitly. Keep public TLS errors sanitized but distinguish chain-trust from service-identity failure. The NIOSSL custom callback replaces built-in verification, so it must complete successfully only after both trust and identity checks.
 
 - [ ] **Step 4: Write failing STARTTLS pipeline tests**
 
-Use a loopback NIO server with a plaintext greeting/STARTTLS response followed by TLS. Assert insertion on the existing channel, successful encrypted reads/writes, handshake failure, identity mismatch, cancellation, close during handshake, and no post-failure writes. Include a delivery that coalesces `OK\r\n` and the first TLS record, plus fragmented TLS records.
+Use a loopback NIO server with a plaintext greeting/STARTTLS response followed by TLS. Assert insertion on the existing channel, successful encrypted reads/writes, handshake failure, identity mismatch, cancellation, close during handshake, and no post-failure writes. Include a delivery that coalesces `OK\r\n` and the first TLS record, plus fragmented TLS records. The generic client must read the STARTTLS terminal response with one-byte transport reads so the concrete transport retains any coalesced TLS suffix; update the fake transport to honor `maxBytes` by splitting scripted reads.
 
 - [ ] **Step 5: Implement `upgradeToTLS(identity:)`**
 
-Serialize upgrade on the channel event loop. Pause application delivery at the exact plaintext response boundary, insert `NIOSSLClientHandler` before the application inbound bridge, and replay any already-buffered post-response bytes through the TLS handler. Complete only after handshake plus injected Security.framework chain trust and typed service-identity validation succeed. Any failure closes the channel and releases pending operations.
+Serialize upgrade on the channel event loop. The client reads the STARTTLS terminal line one byte at a time; therefore any bytes remaining in the NIO transport's application buffer begin at a TLS-record boundary. Pause application delivery, atomically extract that unread suffix, insert `NIOSSLClientHandler` before the retained application inbound bridge, replay the suffix from the pipeline head, and restore read mode. Complete only after `TLSUserEvent.handshakeCompleted` plus injected Security.framework chain trust and typed service-identity validation succeed. Any failure closes the channel and releases pending operations.
 
 - [ ] **Step 6: Run GREEN/full tests and commit**
 
