@@ -68,7 +68,9 @@ public struct SieveServiceDiscovery: Sendable {
               let sourceDomain = SieveDNSName.canonical(String(emailAddress[emailAddress.index(after: at)...])) else {
             throw SieveServiceDiscoveryError.invalidEmailAddress
         }
-        let answer = try await resolver.records(for: "_sieve._tcp.\(sourceDomain)")
+        let queryName = "_sieve._tcp.\(sourceDomain)"
+        guard queryName.utf8.count <= 253 else { throw SieveServiceDiscoveryError.invalidEmailAddress }
+        let answer = try await resolver.records(for: queryName)
         try Task.checkCancellation()
         let records = try answer.map { try $0.normalized() }
         guard let priority = records.map(\.priority).min() else { throw SieveServiceDiscoveryError.noRecords }

@@ -54,24 +54,33 @@ private final class ScriptedDNSQuery: DNSServiceQuery {
 }
 
 private final class StubDNSServiceClient: DNSServiceClient, @unchecked Sendable {
+    enum Reply {
+        case srv
+        case error(Int32)
+        case cnameThenSRV
+    }
+
     private let lock = NSLock()
     private var deallocations = 0
     private var queries = 0
+    private var queryFlags: UInt32 = 0
     let queryStatus: Int32
     let dispatchStatus: Int32
-    let callbackError: Int32
+    let reply: Reply
     let sendsReply: Bool
     let onStart: (@Sendable () -> Void)?
     init(queryStatus: Int32 = 0, dispatchStatus: Int32 = 0, callbackError: Int32 = 0,
-         sendsReply: Bool = true, onStart: (@Sendable () -> Void)? = nil) {
-        self.queryStatus = queryStatus; self.dispatchStatus = dispatchStatus; self.callbackError = callbackError
+         reply: Reply? = nil, sendsReply: Bool = true, onStart: (@Sendable () -> Void)? = nil) {
+        self.queryStatus = queryStatus; self.dispatchStatus = dispatchStatus
+        self.reply = reply ?? (callbackError == 0 ? .srv : .error(callbackError))
         self.sendsReply = sendsReply; self.onStart = onStart
     }
     private var callback: DNSServiceQueryRecordReply?
     private var context: UnsafeMutableRawPointer?
-    func query(name: String, callback: @escaping DNSServiceQueryRecordReply, context: UnsafeMutableRawPointer) -> (status: Int32, reference: DNSServiceRef?) {
+    func query(name: String, flags: UInt32, callback: @escaping DNSServiceQueryRecordReply, context: UnsafeMutableRawPointer) -> (status: Int32, reference: DNSServiceRef?) {
         lock.lock(); defer { lock.unlock() }
         queries += 1
+        queryFlags = flags
         self.callback = callback; self.context = context
         return (queryStatus, queryStatus == 0 ? OpaquePointer(bitPattern: 1)! : nil)
     }
@@ -83,11 +92,20 @@ private final class StubDNSServiceClient: DNSServiceClient, @unchecked Sendable 
             lock.lock()
             let callback = self.callback, context = self.context
             lock.unlock()
-            if callbackError != 0 {
+            let bytes: [UInt8] = [0x12, 0x34, 0x56, 0x78, 0x10, 0x5e, 4, 77, 65, 73, 76, 7, 101, 120, 97, 109, 112, 108, 101, 3, 111, 114, 103, 0]
+            switch reply {
+            case .error(let error):
                 // All arguments except the context/error are undefined on failure.
-                callback?(reference, UInt32.max, 0, callbackError, nil, 0, 0, UInt16.max, UnsafeRawPointer(bitPattern: 1), 0, context)
-            } else {
-                let bytes: [UInt8] = [0x12, 0x34, 0x56, 0x78, 0x10, 0x5e, 4, 77, 65, 73, 76, 7, 101, 120, 97, 109, 112, 108, 101, 3, 111, 114, 103, 0]
+                callback?(reference, UInt32.max, 0, error, nil, 0, 0, UInt16.max, UnsafeRawPointer(bitPattern: 1), 0, context)
+            case .srv:
+                bytes.withUnsafeBytes {
+                    callback?(reference, UInt32(kDNSServiceFlagsAdd), 0, 0, nil, 33, 1, UInt16($0.count), $0.baseAddress, 0, context)
+                }
+            case .cnameThenSRV:
+                let cname: [UInt8] = [4, 77, 65, 73, 76, 7, 101, 120, 97, 109, 112, 108, 101, 3, 111, 114, 103, 0]
+                cname.withUnsafeBytes {
+                    callback?(reference, UInt32(kDNSServiceFlagsAdd), 0, 0, nil, UInt16(kDNSServiceType_CNAME), 1, UInt16($0.count), $0.baseAddress, 0, context)
+                }
                 bytes.withUnsafeBytes {
                     callback?(reference, UInt32(kDNSServiceFlagsAdd), 0, 0, nil, 33, 1, UInt16($0.count), $0.baseAddress, 0, context)
                 }
@@ -103,6 +121,10 @@ private final class StubDNSServiceClient: DNSServiceClient, @unchecked Sendable 
     var counts: (queries: Int, deallocations: Int) {
         lock.lock(); defer { lock.unlock() }
         return (queries, deallocations)
+    }
+    var flags: UInt32 {
+        lock.lock(); defer { lock.unlock() }
+        return queryFlags
     }
 }
 
@@ -126,6 +148,31 @@ final class SieveServiceDiscoveryTests: XCTestCase {
         XCTAssertEqual(endpoint.host, "mail.target.net")
         XCTAssertEqual(endpoint.port, 4190)
         XCTAssertEqual(endpoint.referenceIdentifiers, [.srv(service: "sieve", domain: "example.org"), .dns("example.org")])
+    }
+
+    func testAutomaticDiscoveryValidatesCompleteSRVOwnerNameLength() async throws {
+        let acceptedDomain = [String(repeating: "a", count: 63), String(repeating: "b", count: 63),
+                              String(repeating: "c", count: 63), String(repeating: "d", count: 49)].joined(separator: ".")
+        let rejectedDomain = [String(repeating: "a", count: 63), String(repeating: "b", count: 63),
+                              String(repeating: "c", count: 63), String(repeating: "d", count: 50)].joined(separator: ".")
+        XCTAssertEqual(acceptedDomain.utf8.count, 241)
+        XCTAssertEqual(rejectedDomain.utf8.count, 242)
+
+        let resolver = RecordingSRVResolver([record("mail.example.org")])
+        _ = try await SieveServiceDiscovery(resolver: resolver, random: FixedSieveRandom(0))
+            .discover(emailAddress: "user@\(acceptedDomain)")
+        let acceptedQueries = await resolver.names
+        XCTAssertEqual(acceptedQueries, ["_sieve._tcp.\(acceptedDomain)"])
+
+        do {
+            _ = try await SieveServiceDiscovery(resolver: resolver, random: FixedSieveRandom(0))
+                .discover(emailAddress: "user@\(rejectedDomain)")
+            XCTFail("Accepted an SRV owner name longer than 253 text bytes")
+        } catch {
+            XCTAssertEqual(error as? SieveServiceDiscoveryError, .invalidEmailAddress)
+        }
+        let finalQueries = await resolver.names
+        XCTAssertEqual(finalQueries.count, 1)
     }
 
     func testInvalidEmailAndSourceDomainNeverQueryResolver() async {
@@ -287,6 +334,29 @@ final class SieveServiceDiscoveryTests: XCTestCase {
             XCTAssertEqual(client.counts.queries, 1)
             XCTAssertEqual(client.counts.deallocations, queryError == 0 ? 1 : 0)
         }
+    }
+
+    func testSystemDNSServiceWrapperRequestsAndMapsAuthoritativeNegativeAnswers() async throws {
+        for error in [Int32(kDNSServiceErr_NoSuchName), Int32(kDNSServiceErr_NoSuchRecord)] {
+            let client = StubDNSServiceClient(reply: .error(error))
+            let resolver = DNSServiceResolver(timeout: 1, maximumRecords: 256, maximumRDataBytes: 65536) {
+                SystemDNSServiceQuery(client: client)
+            }
+            let records = try await resolver.records(for: "_sieve._tcp.missing.example.org")
+            XCTAssertEqual(records, [])
+            XCTAssertNotEqual(client.flags & UInt32(kDNSServiceFlagsReturnIntermediates), 0)
+            XCTAssertEqual(client.counts.deallocations, 1)
+        }
+    }
+
+    func testSystemDNSServiceWrapperIgnoresCNAMEIntermediateUntilSRVAnswer() async throws {
+        let client = StubDNSServiceClient(reply: .cnameThenSRV)
+        let resolver = DNSServiceResolver(timeout: 1, maximumRecords: 256, maximumRDataBytes: 65536) {
+            SystemDNSServiceQuery(client: client)
+        }
+        let records = try await resolver.records(for: "_sieve._tcp.alias.example.org")
+        XCTAssertEqual(records, [record("mail.example.org", priority: 0x1234, weight: 0x5678)])
+        XCTAssertEqual(client.counts.deallocations, 1)
     }
 
     func testSystemDNSServiceWrapperTimeoutAndCancellationDeallocateOnce() async {

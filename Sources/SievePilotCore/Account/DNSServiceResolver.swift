@@ -43,6 +43,20 @@ internal struct DNSServiceReply: Sendable {
     let recordType: UInt16
     let recordClass: UInt16
     let rdata: [UInt8]
+    let isNegativeAnswer: Bool
+    let isIntermediate: Bool
+
+    init(add: Bool, moreComing: Bool, errorCode: Int32, recordType: UInt16, recordClass: UInt16,
+         rdata: [UInt8], isNegativeAnswer: Bool = false, isIntermediate: Bool = false) {
+        self.add = add
+        self.moreComing = moreComing
+        self.errorCode = errorCode
+        self.recordType = recordType
+        self.recordClass = recordClass
+        self.rdata = rdata
+        self.isNegativeAnswer = isNegativeAnswer
+        self.isIntermediate = isIntermediate
+    }
 }
 
 // start/cancel and all callbacks run on the supplied serial queue. start never calls back inline;
@@ -106,6 +120,11 @@ private final class DNSServiceOperation: @unchecked Sendable {
         guard terminalResult == nil else { return }
         do {
             guard reply.errorCode == 0 else { throw SieveServiceDiscoveryError.dnsService(reply.errorCode) }
+            if reply.isNegativeAnswer {
+                finishLocked(.success(records.sorted(by: SieveSRVRecord.canonicalOrder)))
+                return
+            }
+            if reply.isIntermediate { return }
             let (bytes, overflow) = receivedBytes.addingReportingOverflow(reply.rdata.count)
             guard !overflow, bytes <= maximumRDataBytes else { throw SieveServiceDiscoveryError.responseLimitExceeded }
             receivedBytes = bytes
@@ -165,15 +184,15 @@ private final class DNSServiceOperation: @unchecked Sendable {
 }
 
 internal protocol DNSServiceClient: Sendable {
-    func query(name: String, callback: @escaping DNSServiceQueryRecordReply, context: UnsafeMutableRawPointer) -> (status: Int32, reference: DNSServiceRef?)
+    func query(name: String, flags: UInt32, callback: @escaping DNSServiceQueryRecordReply, context: UnsafeMutableRawPointer) -> (status: Int32, reference: DNSServiceRef?)
     func setDispatchQueue(reference: DNSServiceRef, queue: DispatchQueue) -> Int32
     func deallocate(reference: DNSServiceRef)
 }
 
 private struct SystemDNSServiceClient: DNSServiceClient {
-    func query(name: String, callback: @escaping DNSServiceQueryRecordReply, context: UnsafeMutableRawPointer) -> (status: Int32, reference: DNSServiceRef?) {
+    func query(name: String, flags: UInt32, callback: @escaping DNSServiceQueryRecordReply, context: UnsafeMutableRawPointer) -> (status: Int32, reference: DNSServiceRef?) {
         var reference: DNSServiceRef?
-        let status = DNSServiceQueryRecord(&reference, 0, 0, name, UInt16(kDNSServiceType_SRV), UInt16(kDNSServiceClass_IN), callback, context)
+        let status = DNSServiceQueryRecord(&reference, flags, 0, name, UInt16(kDNSServiceType_SRV), UInt16(kDNSServiceClass_IN), callback, context)
         return (status, reference)
     }
     func setDispatchQueue(reference: DNSServiceRef, queue: DispatchQueue) -> Int32 {
@@ -192,17 +211,28 @@ internal final class SystemDNSServiceQuery: DNSServiceQuery {
 
     func start(name: String, queue: DispatchQueue, callback: @escaping (DNSServiceReply) -> Void) throws {
         self.callback = callback
-        let result = client.query(name: name, callback: { _, flags, _, error, _, type, recordClass, length, data, _, context in
+        let result = client.query(name: name, flags: UInt32(kDNSServiceFlagsReturnIntermediates), callback: { _, flags, _, error, _, type, recordClass, length, data, _, context in
             guard let context else { return }
             let owner = Unmanaged<SystemDNSServiceQuery>.fromOpaque(context).takeUnretainedValue()
             // On error every other C callback argument is undefined; do not dereference RDATA.
             if error != kDNSServiceErr_NoError {
-                owner.callback?(DNSServiceReply(add: false, moreComing: false, errorCode: error, recordType: 0, recordClass: 0, rdata: []))
+                let negative = error == kDNSServiceErr_NoSuchName || error == kDNSServiceErr_NoSuchRecord
+                owner.callback?(DNSServiceReply(add: false, moreComing: false,
+                                                errorCode: negative ? 0 : error,
+                                                recordType: 0, recordClass: 0, rdata: [],
+                                                isNegativeAnswer: negative))
+                return
+            }
+            let moreComing = flags & UInt32(kDNSServiceFlagsMoreComing) != 0
+            if type == UInt16(kDNSServiceType_CNAME) {
+                owner.callback?(DNSServiceReply(add: false, moreComing: moreComing, errorCode: 0,
+                                                recordType: type, recordClass: recordClass, rdata: [],
+                                                isIntermediate: true))
                 return
             }
             let bytes = data.map { Array(UnsafeRawBufferPointer(start: $0, count: Int(length))) } ?? []
             owner.callback?(DNSServiceReply(add: flags & UInt32(kDNSServiceFlagsAdd) != 0,
-                                            moreComing: flags & UInt32(kDNSServiceFlagsMoreComing) != 0,
+                                            moreComing: moreComing,
                                             errorCode: 0, recordType: type, recordClass: recordClass, rdata: bytes))
         }, context: Unmanaged.passUnretained(self).toOpaque())
         guard result.status == kDNSServiceErr_NoError else { throw SieveServiceDiscoveryError.dnsService(result.status) }
