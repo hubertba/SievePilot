@@ -11,7 +11,7 @@ import Testing
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)),
             .write(Data("STARTTLS\r\n".utf8)), .read(Data("OK\r\n".utf8)),
-            .upgrade(identity), .write(Data("CAPABILITY\r\n".utf8)), .read(Data(postTLS.utf8))
+            .upgrade(identity), .read(Data(postTLS.utf8))
         ])
         _ = try await makeClient(transport).connectAndStartTLS(identity: identity)
         #expect(await transport.readLimits == [4096, 1, 1, 1, 1, 4096])
@@ -30,7 +30,7 @@ import Testing
             .connect, .read(Data(greeting.prefix(18).utf8)),
             .read(Data(greeting.dropFirst(18).utf8)),
             .write(Data("STARTTLS\r\n".utf8)), .read(Data("OK\r\n".utf8)),
-            .upgrade(identity), .write(Data("CAPABILITY\r\n".utf8)),
+            .upgrade(identity),
             .read(Data(postTLS.prefix(23).utf8)), .read(Data(postTLS.dropFirst(23).utf8)),
         ])
         let client = makeClient(transport)
@@ -43,6 +43,69 @@ import Testing
         #expect(!capabilities.supportsSieveExtension("unsafe"))
         #expect(await transport.assertComplete())
         #expect(await transport.closeCount == 0)
+    }
+
+    // RFC 5804 §2.2: once the TLS layer is up the server re-issues its capabilities unsolicited. The client
+    // must consume that block without writing CAPABILITY, or every later response is read one reply late.
+    @Test func rfc5804UnsolicitedPostTLSCapabilitiesAreConsumedBeforeAuthenticate() async throws {
+        let startTLS = Data("STARTTLS\r\n".utf8)
+        let authenticate = Data("AUTHENTICATE \"PLAIN\" \"\(Data("\0user\0secret".utf8).base64EncodedString())\"\r\n".utf8)
+        let capability = Data("CAPABILITY\r\n".utf8)
+        let postAuthentication = postTLS.replacingOccurrences(of: "secure", with: "authenticated")
+        let transport = FakeManageSieveTransport([
+            .connect, .read(Data(greeting.utf8)),
+            .write(startTLS), .read(Data("OK\r\n".utf8)),
+            .upgrade(identity), .read(Data(postTLS.utf8)),
+            .write(authenticate), .read(Data("OK\r\n".utf8)),
+            .write(capability), .read(Data(postAuthentication.utf8)),
+        ])
+        let client = makeClient(transport)
+        let capabilities = try await client.connectAndStartTLS(identity: identity)
+        #expect(await client.state == .encryptedReady)
+        #expect(capabilities.isAuthoritative)
+        #expect(capabilities.implementation == Data("secure".utf8))
+        #expect(await transport.writes == [startTLS])
+        try await client.authenticatePlain(username: "user", password: "secret")
+        #expect(await client.state == .authenticated)
+        #expect(await client.capabilities?.implementation == Data("authenticated".utf8))
+        #expect(await transport.writes == [startTLS, authenticate, capability])
+        #expect(await transport.assertComplete())
+        #expect(await transport.closeCount == 0)
+    }
+
+    // A server that never re-issues capabilities stalls the read. The handshake deadline ends it; the client
+    // must not send a competing CAPABILITY whose reply could later be mistaken for another command's response.
+    @Test func serverThatNeverReissuesCapabilitiesTimesOutWithoutCompetingCapabilityCommand() async {
+        let startTLS = Data("STARTTLS\r\n".utf8)
+        let transport = FakeManageSieveTransport([
+            .connect, .read(Data(greeting.utf8)),
+            .write(startTLS), .read(Data("OK\r\n".utf8)),
+            .upgrade(identity), .suspendRead,
+        ])
+        let clock = ManualManageSieveClock()
+        let client = ManageSieveClient(
+            transport: transport, clock: clock,
+            timeoutPolicy: ManageSieveTimeoutPolicy(connect: .seconds(2), startTLS: .seconds(3), authentication: .seconds(5), command: .seconds(5)),
+            limits: .production, logger: FakeManageSieveLogger()
+        )
+        let pending = Task { try await client.connectAndStartTLS(identity: identity) }
+        for _ in 0..<20_000 {
+            let suspended = await transport.suspension == .read
+            let armed = await clock.pendingCount == 1
+            let failed = await transport.closeCount > 0
+            if (suspended && armed) || failed { break }
+            await Task.yield()
+        }
+        #expect(await transport.suspension == .read, "The client must wait for the unsolicited capabilities")
+        #expect(await clock.durations == [.seconds(5)])
+        #expect(await transport.writes == [startTLS])
+        await clock.fire()
+        await expectError(.timeout) { try await pending.value }
+        #expect(await client.state == .closed)
+        #expect(await client.capabilities == nil)
+        #expect(await transport.writes == [startTLS])
+        #expect(await transport.closeCount == 1)
+        #expect(await transport.assertComplete())
     }
 
     @Test(arguments: [
@@ -128,13 +191,14 @@ import Testing
     @Test(arguments: [
         ("\"SASL\" \"PLAIN\"\r\nOK\r\n", ManageSieveClientError.parse),
         ("\"IMPLEMENTATION\" \"secure\"\r\nOK\r\n", .parse),
+        ("OK\r\n", .parse), // TLS acknowledged without the mandatory capability re-issue
+        ("NO\r\n", .serverNo),
         ("BYE\r\n", .serverBye),
     ])
     func invalidEncryptedCapabilitiesNeverBecomeVisible(wire: String, expected: ManageSieveClientError) async {
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
-            .read(Data("OK\r\n".utf8)), .upgrade(identity),
-            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(wire.utf8)),
+            .read(Data("OK\r\n".utf8)), .upgrade(identity), .read(Data(wire.utf8)),
         ])
         let client = makeClient(transport)
         await expectError(expected) { try await client.connectAndStartTLS(identity: identity) }
@@ -153,8 +217,7 @@ import Testing
         }
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
-            .read(Data("OK\r\n".utf8)), .upgrade(identity),
-            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(wire.utf8)),
+            .read(Data("OK\r\n".utf8)), .upgrade(identity), .read(Data(wire.utf8)),
         ])
         let client = makeClient(transport)
         await expectError(.parse) { try await client.connectAndStartTLS(identity: identity) }
@@ -168,8 +231,7 @@ import Testing
     @Test func capabilityRefreshReplacesOnlyOnOKRetainsOnNOAndClosesOnBYE() async throws {
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
-            .read(Data("OK\r\n".utf8)), .upgrade(identity),
-            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(postTLS.utf8)),
+            .read(Data("OK\r\n".utf8)), .upgrade(identity), .read(Data(postTLS.utf8)),
             .write(Data("CAPABILITY\r\n".utf8)), .read(Data("NO\r\n".utf8)),
             .write(Data("CAPABILITY\r\n".utf8)), .read(Data(postTLS.replacingOccurrences(of: "secure", with: "new").utf8)),
             .write(Data("CAPABILITY\r\n".utf8)), .read(Data("BYE\r\n".utf8)),
@@ -193,8 +255,7 @@ import Testing
     @Test func malformedCapabilityRefreshClosesAndClearsSnapshot() async throws {
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
-            .read(Data("OK\r\n".utf8)), .upgrade(identity),
-            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(postTLS.utf8)),
+            .read(Data("OK\r\n".utf8)), .upgrade(identity), .read(Data(postTLS.utf8)),
             .write(Data("CAPABILITY\r\n".utf8)), .read(Data("\"SASL\" \"PLAIN\"\r\nOK\r\n".utf8)),
         ])
         let client = makeClient(transport)
@@ -210,7 +271,7 @@ import Testing
         let transport = FakeManageSieveTransport([
             .suspendConnect, .read(Data(greeting.utf8)),
             .write(Data("STARTTLS\r\n".utf8)), .read(Data("OK\r\n".utf8)),
-            .upgrade(identity), .write(Data("CAPABILITY\r\n".utf8)), .read(Data(postTLS.utf8)),
+            .upgrade(identity), .read(Data(postTLS.utf8)),
         ])
         let client = makeClient(transport)
         let first = Task { try await client.connectAndStartTLS(identity: identity) }

@@ -142,10 +142,14 @@ private struct AuthenticatedSessionAdapter: AuthenticatedManageSieveSession {
     func deleteScript(name: String, timeout: Duration?) async throws { try await client.deleteScript(name: name, timeout: timeout) }
 }
 
-private final class RealManageSieveClientSession: ManageSieveClientSession, @unchecked Sendable {
+internal final class RealManageSieveClientSession: ManageSieveClientSession, @unchecked Sendable {
     private let client: ManageSieveClient
-    init(endpoint: NIOManageSieveTransport.Endpoint) {
-        client = ManageSieveClient(transport: NIOManageSieveTransport(endpoint: endpoint), clock: SystemManageSieveClock(),
+    convenience init(endpoint: NIOManageSieveTransport.Endpoint) {
+        self.init(transport: NIOManageSieveTransport(endpoint: endpoint))
+    }
+    // Loopback tests inject a transport with fixture trust; production always uses the system-trust transport above.
+    init(transport: NIOManageSieveTransport) {
+        client = ManageSieveClient(transport: transport, clock: SystemManageSieveClock(),
                                    timeoutPolicy: .production, limits: .production, logger: SilentManageSieveLogger())
     }
     var capabilities: ManageSieveCapabilities? { get async { await client.capabilities } }

@@ -10,7 +10,7 @@ import Testing
 
     private var handshake: [FakeManageSieveTransport.Step] {
         [.connect, .read(Data("\"STARTTLS\"\r\nOK\r\n".utf8)), .write(Data("STARTTLS\r\n".utf8)),
-         .read(Data("OK\r\n".utf8)), .upgrade(identity), .write(Data("CAPABILITY\r\n".utf8)), .read(secure)]
+         .read(Data("OK\r\n".utf8)), .upgrade(identity), .read(secure)]
     }
 
     private var plain: Data {
@@ -53,7 +53,7 @@ import Testing
         case .greeting: steps = [.connect, .suspendRead]
         case .startTLS: steps = Array(handshake.prefix(3)) + [.suspendRead]
         case .upgrade: steps = Array(handshake.prefix(4)) + [.suspendUpgrade(identity)]
-        case .capabilities: steps = Array(handshake.prefix(6)) + [.suspendRead]
+        case .capabilities: steps = Array(handshake.prefix(5)) + [.suspendRead]
         case .challenge: steps = handshake + [.write(Data("AUTHENTICATE \"LOGIN\"\r\n".utf8)), .suspendRead]
         case .authRefresh: steps = handshake + Array(authentication.prefix(3)) + [.suspendRead]
         case .command: steps = handshake + authentication + [.write(Data("LISTSCRIPTS\r\n".utf8)), .suspendRead]

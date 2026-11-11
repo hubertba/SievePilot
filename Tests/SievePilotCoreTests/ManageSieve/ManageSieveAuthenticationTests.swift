@@ -13,8 +13,7 @@ import Testing
     private func setup(_ suffix: [FakeManageSieveTransport.Step], capabilities: String? = nil) -> (FakeManageSieveTransport, ManageSieveClient) {
         let transport = FakeManageSieveTransport([
             .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
-            .read(Data("OK\r\n".utf8)), .upgrade(identity),
-            .write(Data("CAPABILITY\r\n".utf8)), .read(Data((capabilities ?? secure).utf8)),
+            .read(Data("OK\r\n".utf8)), .upgrade(identity), .read(Data((capabilities ?? secure).utf8)),
         ] + suffix)
         return (transport, ManageSieveClient(transport: transport, clock: FakeManageSieveClock(),
             timeoutPolicy: ManageSieveTimeoutPolicy(connect: .seconds(5), startTLS: .seconds(5), authentication: .seconds(5), command: .seconds(5)),
@@ -251,7 +250,7 @@ import Testing
     @Test func authenticationIllegalStateBeforeAndDuringHandshake() async throws {
         let transport = FakeManageSieveTransport([.suspendConnect,
             .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)), .read(Data("OK\r\n".utf8)),
-            .upgrade(identity), .write(Data("CAPABILITY\r\n".utf8)), .read(Data(secure.utf8)),
+            .upgrade(identity), .read(Data(secure.utf8)),
         ])
         let client = ManageSieveClient(transport: transport, clock: FakeManageSieveClock(),
             timeoutPolicy: ManageSieveTimeoutPolicy(connect: .seconds(5), startTLS: .seconds(5), authentication: .seconds(5), command: .seconds(5)),

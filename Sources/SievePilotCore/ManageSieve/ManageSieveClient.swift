@@ -436,16 +436,25 @@ public actor ManageSieveClient {
         capabilities = nil
         try ensureOpen()
         logger.record(.encrypted)
-        let secure = try await refreshCapabilities()
+        // RFC 5804 §2.2: once TLS is established the server re-issues its capabilities, followed by OK,
+        // without being asked. Consume that block here. Writing CAPABILITY first would queue a second
+        // reply behind it and leave every later command reading the previous command's response. A
+        // server that never re-issues is ended by the handshake deadline, never by a competing command.
+        let secure = try interpretCapabilities(try await readResponse())
         try ensureOpen()
         capabilities = secure
         state = .encryptedReady
         return secure
     }
 
+    /// Explicit refresh. PLAIN and LOGIN negotiate no SASL security layer, so the server sends no
+    /// capability block of its own after authentication and the client must ask.
     private func refreshCapabilities() async throws -> ManageSieveCapabilities {
         try await send("CAPABILITY\r\n")
-        let response = try await readResponse()
+        return try interpretCapabilities(try await readResponse())
+    }
+
+    private func interpretCapabilities(_ response: ManageSieveCommandResponse) throws -> ManageSieveCapabilities {
         guard response.status.status == .ok || response.dataLines.isEmpty else {
             throw ManageSieveClientError.parse
         }

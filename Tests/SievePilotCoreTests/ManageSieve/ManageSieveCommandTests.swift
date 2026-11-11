@@ -16,8 +16,7 @@ import Testing
         ] : []
         let transport = FakeManageSieveTransport([
             .connect, .read(Data("\"STARTTLS\"\r\nOK\r\n".utf8)),
-            .write(Data("STARTTLS\r\n".utf8)), .read(Data("OK\r\n".utf8)), .upgrade(identity),
-            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(secure.utf8)),
+            .write(Data("STARTTLS\r\n".utf8)), .read(Data("OK\r\n".utf8)), .upgrade(identity), .read(Data(secure.utf8)),
         ] + auth + suffix)
         let client = ManageSieveClient(transport: transport, clock: FakeManageSieveClock(),
             timeoutPolicy: ManageSieveTimeoutPolicy(connect: .seconds(5), startTLS: .seconds(5), authentication: .seconds(5), command: .seconds(5)),

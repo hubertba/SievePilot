@@ -126,7 +126,7 @@ Recognized values include:
 - `LANGUAGE`;
 - `NOTIFY` and unknown future capabilities.
 
-Capabilities carry an origin: pre-TLS greeting or post-TLS `CAPABILITY`. The client never exposes pre-TLS SASL or Sieve extensions as authoritative. When TLS succeeds, the pre-TLS set is discarded before the post-TLS request is sent.
+Capabilities carry an origin: pre-TLS greeting or post-TLS capability response. The client never exposes pre-TLS SASL or Sieve extensions as authoritative. When TLS succeeds, the pre-TLS set is discarded before the post-TLS capability response is read.
 
 ## Transport boundary
 
@@ -191,9 +191,11 @@ Public operations validate state before writing. Calling authentication before T
 5. Send `STARTTLS\r\n` and require terminal `OK`.
 6. Invoke `transport.upgradeToTLS(identity:)`.
 7. On success, erase all pre-TLS capabilities.
-8. Send `CAPABILITY\r\n` over TLS.
+8. Read the capability response that the server re-issues, unsolicited, once TLS is established (RFC 5804 §2.2). Do not send `CAPABILITY` first: its reply would queue behind the unsolicited response and desynchronize every later command.
 9. Parse and store the post-TLS capability set.
 10. Enter `encryptedReady`.
+
+A server that never re-issues its capabilities leaves step 8 waiting until the STARTTLS deadline closes the connection; a terminal `OK` without the required capabilities is a parse failure. The client never sends a competing `CAPABILITY` to recover.
 
 A server that advertised SASL before TLS but omits it afterward cannot be authenticated. A server that changes Sieve extensions after TLS uses only the post-TLS values.
 

@@ -77,7 +77,8 @@ for names starting with `sievepilot-` and restore from your backup if needed.
 
 After authentication the server should advertise a post-TLS capability list with `IMPLEMENTATION`, `VERSION`, `SASL`
 (`PLAIN` or `LOGIN`), and `SIEVE` including `vacation`, `date`, and `relational`. `CHECKSCRIPT` is used when advertised.
-The server must support `STARTTLS` on the ManageSieve port.
+The server must support `STARTTLS` on the ManageSieve port and, as RFC 5804 §2.2 requires, re-issue its capabilities
+unsolicited once TLS is established.
 
 ## Running
 

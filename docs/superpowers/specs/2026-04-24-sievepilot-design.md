@@ -180,7 +180,7 @@ The standard port-4190 flow follows RFC 5804:
 1. Connect over TCP and receive a bounded unauthenticated greeting.
 2. Require the `STARTTLS` capability and issue `STARTTLS`; do not authenticate or trust pre-TLS SASL or Sieve capabilities.
 3. Establish TLS using the system trust store and fail closed on any trust or identity error. There is no trust-bypass control.
-4. Discard the pre-TLS capability set and issue `CAPABILITY` over TLS.
+4. Discard the pre-TLS capability set and read the capability response the server re-issues, unsolicited, over TLS (RFC 5804 §2.2). Do not issue `CAPABILITY` before that response is consumed.
 5. Select only a configured SASL mechanism advertised after TLS, authenticate, and consume the authenticated capability response.
 6. Perform script operations only in the authenticated state.
 

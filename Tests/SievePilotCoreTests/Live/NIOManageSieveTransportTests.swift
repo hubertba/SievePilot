@@ -3,6 +3,7 @@ import NIOCore
 import NIOEmbedded
 import NIOPosix
 import NIOSSL
+import NIOTLS
 import XCTest
 @testable import SievePilotCore
 
@@ -13,7 +14,11 @@ final class NIOManageSieveTransportTests: XCTestCase {
         private var storedChannel: Channel?
         private var storedBytes = Data()
         private var startTLSContext: NIOSSLContext?
-        init(startTLSContext: NIOSSLContext? = nil) { self.startTLSContext = startTLSContext }
+        private let unsolicitedPostTLS: String?
+        init(startTLSContext: NIOSSLContext? = nil, unsolicitedPostTLS: String? = nil) {
+            self.startTLSContext = startTLSContext
+            self.unsolicitedPostTLS = unsolicitedPostTLS
+        }
         var channel: Channel? { lock.lock(); defer { lock.unlock() }; return storedChannel }
         var bytes: Data { lock.lock(); defer { lock.unlock() }; return storedBytes }
         func channelActive(context: ChannelHandlerContext) {
@@ -34,7 +39,17 @@ final class NIOManageSieveTransportTests: XCTestCase {
                 catch { XCTFail("Server TLS insertion failed"); context.close(promise: nil) }
             }
         }
+        func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+            // RFC 5804 §2.2: the server re-issues its capabilities, unsolicited, as soon as TLS is established.
+            if case .handshakeCompleted = event as? TLSUserEvent, let unsolicitedPostTLS {
+                context.writeAndFlush(NIOAny(ByteBuffer(string: unsolicitedPostTLS)), promise: nil)
+            }
+            context.fireUserInboundEventTriggered(event)
+        }
     }
+
+    private static let unsolicitedPostTLSCapabilities =
+        "\"IMPLEMENTATION\" \"loopback\"\r\n\"VERSION\" \"1.0\"\r\n\"SASL\" \"PLAIN\"\r\n\"SIEVE\" \"fileinto vacation\"\r\nOK \"TLS negotiation successful.\"\r\n"
 
     private func server(group: EventLoopGroup, recorder: ServerRecorder) throws -> Channel {
         try ServerBootstrap(group: group)
@@ -315,11 +330,13 @@ final class NIOManageSieveTransportTests: XCTestCase {
             }.bind(host: "127.0.0.1", port: 0).wait()
     }
 
-    private func startTLSServer(group: EventLoopGroup, fragmented: Bool) throws -> (Channel, ServerRecorder) {
+    private func startTLSServer(group: EventLoopGroup, fragmented: Bool, maximumTLSVersion: TLSVersion? = nil) throws -> (Channel, ServerRecorder) {
         let cert = try NIOSSLCertificate(bytes: Array(tlsFixture("server.der")), format: .der)
         let key = try NIOSSLPrivateKey(bytes: Array(tlsFixture("server-key.pem")), format: .pem)
-        let context = try NIOSSLContext(configuration: .makeServerConfiguration(certificateChain: [.certificate(cert)], privateKey: .privateKey(key)))
-        let recorder = ServerRecorder(startTLSContext: context)
+        var configuration = TLSConfiguration.makeServerConfiguration(certificateChain: [.certificate(cert)], privateKey: .privateKey(key))
+        configuration.maximumTLSVersion = maximumTLSVersion
+        let context = try NIOSSLContext(configuration: configuration)
+        let recorder = ServerRecorder(startTLSContext: context, unsolicitedPostTLS: Self.unsolicitedPostTLSCapabilities)
         let listener = try ServerBootstrap(group: group).childChannelInitializer { channel in
             do {
                 try channel.pipeline.syncOperations.addHandler(FragmentTLSWrites(enabled: fragmented))
@@ -331,7 +348,7 @@ final class NIOManageSieveTransportTests: XCTestCase {
     }
 
     // Event-loop confined; delayed chunks force separate socket deliveries, not just separate writes.
-    private final class FragmentTLSWrites: ChannelOutboundHandler, @unchecked Sendable {
+    final class FragmentTLSWrites: ChannelOutboundHandler, @unchecked Sendable {
         typealias OutboundIn = ByteBuffer
         typealias OutboundOut = ByteBuffer
         let enabled: Bool
@@ -361,9 +378,12 @@ final class NIOManageSieveTransportTests: XCTestCase {
     }
 
     func testTLSUpgradeExistingChannelEncryptedReadWriteAndFragmentedRecords() async throws {
-        for fragmented in [false, true] {
+        // Under TLS 1.2 the server's Finished ends the handshake, so the unsolicited capability block is written
+        // directly behind the last handshake record; under TLS 1.3 it follows the client's Finished.
+        let variants: [(fragmented: Bool, maximumTLSVersion: TLSVersion?)] = [(false, nil), (true, nil), (false, .tlsv12), (true, .tlsv12)]
+        for (fragmented, maximumTLSVersion) in variants {
             let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-            let (listener, recorder) = try startTLSServer(group: group, fragmented: fragmented)
+            let (listener, recorder) = try startTLSServer(group: group, fragmented: fragmented, maximumTLSVersion: maximumTLSVersion)
             let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group, trustEvaluator: FixtureTLSChainTrustEvaluator())
             try await transport.connect()
             await waitUntil { recorder.channel != nil }
@@ -374,6 +394,12 @@ final class NIOManageSieveTransportTests: XCTestCase {
             try await transport.write(Data("STARTTLS\r\n".utf8))
             for byte in "OK\r\n".utf8 { let read = try await transport.read(maxBytes: 1); XCTAssertEqual(read, Data([byte])) }
             try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("source.example.org")]))
+            // The re-issued capabilities arrive after the handshake and are readable before the client writes anything.
+            let expectedUnsolicited = Data(Self.unsolicitedPostTLSCapabilities.utf8)
+            var unsolicited = Data()
+            while unsolicited.count < expectedUnsolicited.count { unsolicited.append(try await transport.read(maxBytes: 4096)) }
+            XCTAssertEqual(unsolicited, expectedUnsolicited)
+            XCTAssertTrue(recorder.bytes.isEmpty, "The unsolicited block must not depend on a client command")
             try await transport.write(Data("encrypted request".utf8))
             await waitUntil { recorder.bytes == Data("encrypted request".utf8) }
             try await peer.writeAndFlush(ByteBuffer(string: "encrypted response")).get()
