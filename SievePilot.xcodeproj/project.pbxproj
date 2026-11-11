@@ -12,6 +12,10 @@
 		100000000000000000000003 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000005 /* Assets.xcassets */; };
 		100000000000000000000004 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000006 /* AppModelTests.swift */; };
 		100000000000000000000005 /* SievePilotCore in Frameworks */ = {isa = PBXBuildFile; productRef = 900000000000000000000002 /* SievePilotCore */; };
+		100000000000000000000006 /* AppDependencies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000007 /* AppDependencies.swift */; };
+		100000000000000000000007 /* AppLifecycleCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000008 /* AppLifecycleCoordinator.swift */; };
+		100000000000000000000008 /* SetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000009 /* SetupView.swift */; };
+		100000000000000000000009 /* StatusBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000A /* StatusBanner.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -31,6 +35,10 @@
 		200000000000000000000004 /* SievePilotApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SievePilotApp.swift; sourceTree = "<group>"; };
 		200000000000000000000005 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		200000000000000000000006 /* AppModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTests.swift; sourceTree = "<group>"; };
+		200000000000000000000007 /* AppDependencies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDependencies.swift; sourceTree = "<group>"; };
+		200000000000000000000008 /* AppLifecycleCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLifecycleCoordinator.swift; sourceTree = "<group>"; };
+		200000000000000000000009 /* SetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupView.swift; sourceTree = "<group>"; };
+		20000000000000000000000A /* StatusBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBanner.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -65,10 +73,22 @@
 			isa = PBXGroup;
 			children = (
 				200000000000000000000003 /* AppModel.swift */,
+				200000000000000000000007 /* AppDependencies.swift */,
+				200000000000000000000008 /* AppLifecycleCoordinator.swift */,
+				300000000000000000000005 /* Views */,
 				200000000000000000000004 /* SievePilotApp.swift */,
 				200000000000000000000005 /* Assets.xcassets */,
 			);
 			path = SievePilotApp;
+			sourceTree = "<group>";
+		};
+		300000000000000000000005 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000009 /* SetupView.swift */,
+				20000000000000000000000A /* StatusBanner.swift */,
+			);
+			path = Views;
 			sourceTree = "<group>";
 		};
 		300000000000000000000003 /* SievePilotAppTests */ = {
@@ -194,6 +214,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				100000000000000000000001 /* AppModel.swift in Sources */,
+				100000000000000000000006 /* AppDependencies.swift in Sources */,
+				100000000000000000000007 /* AppLifecycleCoordinator.swift in Sources */,
+				100000000000000000000008 /* SetupView.swift in Sources */,
+				100000000000000000000009 /* StatusBanner.swift in Sources */,
 				100000000000000000000002 /* SievePilotApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

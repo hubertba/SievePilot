@@ -66,9 +66,12 @@ def configurations(target: dict) -> dict[str, dict]:
 app_id, app = target_named("SievePilot")
 test_id, tests = target_named("SievePilotAppTests")
 
-require({"AppModel.swift", "SievePilotApp.swift"}.issubset(
-    phase_items(app, "PBXSourcesBuildPhase")),
-    "app target source membership is incomplete")
+required_app_sources = {
+    "AppModel.swift", "AppDependencies.swift", "AppLifecycleCoordinator.swift",
+    "SetupView.swift", "StatusBanner.swift", "SievePilotApp.swift",
+}
+require(required_app_sources.issubset(phase_items(app, "PBXSourcesBuildPhase")),
+        "app target source membership is incomplete")
 require("Assets.xcassets" in phase_items(app, "PBXResourcesBuildPhase"),
         "app target does not contain Assets.xcassets")
 require("AppModelTests.swift" in phase_items(tests, "PBXSourcesBuildPhase"),
