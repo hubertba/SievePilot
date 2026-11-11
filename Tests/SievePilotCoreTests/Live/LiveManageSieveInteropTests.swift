@@ -4,7 +4,8 @@ import XCTest
 
 // Opt-in interoperability tests against a real ManageSieve server.
 //
-// Every test skips unless the process environment explicitly enables it. Nothing here reads a `.env`
+// Every live test skips unless the process environment explicitly enables it (the outcome-reporting
+// tests at the end of this file are offline and always run). Nothing here reads a `.env`
 // file or any other credential source: only `ProcessInfo.processInfo.environment` is consulted, and
 // the skip decision happens before any network object is constructed. See docs/live-interoperability.md.
 //
@@ -125,6 +126,15 @@ private func safeDescription(_ error: Error) -> String {
     }
 }
 
+/// Reports a rollback or cleanup failure first, then rethrows the exercise failure. The cleanup failure
+/// is recorded even when the exercise also failed, because it means the account may still hold test scripts.
+private func reportOutcome(exerciseFailure: Error?, cleanupFailure: Error?, recordFailure: (String) -> Void) throws {
+    if let cleanupFailure {
+        recordFailure("Rollback or cleanup failed (\(safeDescription(cleanupFailure))); inspect the dedicated account for names starting with sievepilot-")
+    }
+    if let exerciseFailure { throw exerciseFailure }
+}
+
 final class LiveManageSieveInteropTests: XCTestCase {
     func testConnectsSecurelyAuthenticatesAndReadsCapabilities() async throws {
         let configuration = try LiveConfiguration.load(destructive: false)
@@ -188,10 +198,7 @@ final class LiveManageSieveInteropTests: XCTestCase {
             cleanupFailure = error
         }
 
-        if let failure { throw failure }
-        if let cleanupFailure {
-            XCTFail("Rollback or cleanup failed (\(safeDescription(cleanupFailure))); inspect the dedicated account for names starting with sievepilot-")
-        }
+        try reportOutcome(exerciseFailure: failure, cleanupFailure: cleanupFailure) { XCTFail($0) }
     }
 
     // MARK: - Exercise
@@ -299,5 +306,36 @@ final class LiveManageSieveInteropTests: XCTestCase {
                 }
             }
         }
+    }
+}
+
+/// Offline: checks how the destructive test reports its outcome. Uses no network and no environment.
+final class LiveInteropOutcomeReportingTests: XCTestCase {
+    private struct CleanupProbe: Error {}
+
+    func testCleanupFailureIsReportedEvenWhenTheExerciseAlsoFailed() {
+        var recorded: [String] = []
+        XCTAssertThrowsError(try reportOutcome(exerciseFailure: InteropFailure(description: "exercise"),
+                                               cleanupFailure: ManageSieveClientError.transport) { recorded.append($0) }) { error in
+            XCTAssertEqual((error as? InteropFailure)?.description, "exercise", "The exercise failure is still the thrown error")
+        }
+        XCTAssertEqual(recorded.count, 1, "The cleanup failure must not be hidden behind the exercise failure")
+        XCTAssertTrue(recorded.first?.contains("Rollback or cleanup failed (transport)") ?? false)
+        XCTAssertTrue(recorded.first?.contains("sievepilot-") ?? false)
+    }
+
+    func testCleanupFailureAloneIsReportedAndUnknownErrorTypesAreNamedNotDescribed() throws {
+        var recorded: [String] = []
+        try reportOutcome(exerciseFailure: nil, cleanupFailure: CleanupProbe()) { recorded.append($0) }
+        XCTAssertEqual(recorded.count, 1)
+        XCTAssertTrue(recorded.first?.contains("(CleanupProbe)") ?? false)
+    }
+
+    func testExerciseFailureAloneIsRethrownAndSuccessReportsNothing() throws {
+        var recorded: [String] = []
+        XCTAssertThrowsError(try reportOutcome(exerciseFailure: InteropFailure(description: "exercise"),
+                                               cleanupFailure: nil) { recorded.append($0) })
+        try reportOutcome(exerciseFailure: nil, cleanupFailure: nil) { recorded.append($0) }
+        XCTAssertTrue(recorded.isEmpty)
     }
 }
