@@ -187,10 +187,31 @@ final class SieveAccountServiceTests: XCTestCase {
         guard case .malformed = try await service(malformed).refresh(account: account()).outOfOfficeState else { return XCTFail() }
     }
 
-    func testRefreshRejectsUnsupportedRequiredSieveExtensions() async throws {
-        let session = ServiceSession(capabilities: try capabilities(extensions: "vacation"))
-        do { _ = try await service(session).refresh(account: account()); XCTFail() }
-        catch { XCTAssertEqual(error as? SieveAccountServiceError, .unsupportedCapabilities) }
+    func testRefreshRejectsUnsupportedRequiredSieveExtensionsNamingEachMissingOne() async throws {
+        for (extensions, missing) in [
+            ("vacation", ["date", "relational"]),
+            ("date relational", ["vacation"]),
+            ("vacation date", ["relational"]),
+            ("vacation relational", ["date"]),
+            ("fileinto", ["vacation", "date", "relational"])
+        ] {
+            let session = ServiceSession(capabilities: try capabilities(extensions: extensions))
+            do { _ = try await service(session).refresh(account: account()); XCTFail(extensions) }
+            catch { XCTAssertEqual(error as? SieveAccountServiceError, .unsupportedCapabilities(missing: missing), extensions) }
+        }
+    }
+
+    func testApplyFailsClosedNamingMissingExtensionsWithoutUploadOrActivation() async throws {
+        for (extensions, missing) in [("date relational", ["vacation"]), ("vacation", ["date", "relational"])] {
+            let session = ServiceSession(capabilities: try capabilities(extensions: extensions), scripts: ["base": Data("keep;\n".utf8)], active: "base")
+            let manifests = MemoryManifestStore()
+            do { _ = try await service(session, manifests: manifests).applyOutOfOffice(account: account(), configuration: configuration()); XCTFail(extensions) }
+            catch { XCTAssertEqual(error as? SieveAccountServiceError, .unsupportedCapabilities(missing: missing), extensions) }
+            let events = await session.events
+            XCTAssertFalse(events.contains { $0.hasPrefix("put:") || $0.hasPrefix("active:") }, extensions)
+            let records = await manifests.records
+            XCTAssertTrue(records.isEmpty, extensions)
+        }
     }
 
     func testMutationUsesRawBaselineCheckScriptCollisionRetryManifestPhasesAndReadBack() async throws {

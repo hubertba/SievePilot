@@ -245,14 +245,62 @@ final class OutOfOfficeFlowTests: XCTestCase {
         XCTAssertFalse(text.contains("Out of office is unavailable"))
     }
 
-    func testUnsupportedServerErrorShowsRequiredCapabilities() async throws {
+    /// Production path: the core fails closed with the missing set instead of returning a snapshot.
+    func testProductionUnsupportedErrorOnRefreshNamesMissingVacationVersusScheduling() async throws {
+        let vacation = try await harness()
+        await vacation.service.setError(SieveAccountServiceError.unsupportedCapabilities(missing: ["vacation"]))
+        await vacation.model.refresh()
+        XCTAssertEqual(vacation.model.operationState, .error)
+        XCTAssertNil(vacation.model.verifiedSnapshot)
+        XCTAssertEqual(vacation.model.missingCapabilities, ["vacation"])
+        XCTAssertFalse(vacation.model.isOutOfOfficeAvailable)
+        XCTAssertFalse(vacation.model.canSaveAndActivate)
+        var text = vacation.model.capabilityLimitations.joined(separator: " ")
+        XCTAssertTrue(text.contains("Out of office is unavailable"))
+        XCTAssertTrue(text.contains("vacation"))
+        XCTAssertFalse(text.contains("Scheduled expiry"))
+        XCTAssertTrue(try XCTUnwrap(vacation.model.userFacingError).contains("vacation"))
+
+        let scheduling = try await harness()
+        await scheduling.service.setError(SieveAccountServiceError.unsupportedCapabilities(missing: ["date", "relational"]))
+        await scheduling.model.refresh()
+        XCTAssertEqual(scheduling.model.missingCapabilities, ["date", "relational"])
+        XCTAssertFalse(scheduling.model.isOutOfOfficeAvailable)
+        text = scheduling.model.capabilityLimitations.joined(separator: " ")
+        XCTAssertTrue(text.contains("Scheduled expiry is unavailable"))
+        XCTAssertTrue(text.contains("date, relational"))
+        XCTAssertTrue(text.contains("no local fallback"))
+        XCTAssertFalse(text.contains("Out of office is unavailable"))
+        let message = try XCTUnwrap(scheduling.model.userFacingError)
+        XCTAssertTrue(message.contains("date") && message.contains("relational"))
+        XCTAssertFalse(message.contains("vacation"))
+    }
+
+    func testProductionUnsupportedErrorOnApplyNamesMissingExtensionsAndNeverReportsSuccess() async throws {
         let h = try await harness()
-        await h.service.setError(SieveAccountServiceError.unsupportedCapabilities)
-        await h.model.refresh()
+        fillValid(h.model)
+        await h.service.enqueueOutcome(.failure(SieveAccountServiceError.unsupportedCapabilities(missing: ["date"])))
+        await h.model.saveAndActivate()
         XCTAssertEqual(h.model.operationState, .error)
+        XCTAssertEqual(h.model.outOfOfficeStatus, .unknown)
+        XCTAssertEqual(h.model.missingCapabilities, ["date"])
         XCTAssertFalse(h.model.isOutOfOfficeAvailable)
-        let text = h.model.capabilityLimitations.joined(separator: " ")
-        for name in ["vacation", "date", "relational"] { XCTAssertTrue(text.contains(name)) }
+        XCTAssertTrue(h.model.capabilityLimitations.joined(separator: " ").contains("Scheduled expiry"))
+        await h.model.disable()
+        let applied = await h.service.appliedConfigurations()
+        XCTAssertEqual(applied.count, 1, "controls stay blocked after the server reports missing extensions")
+    }
+
+    func testReportedMissingCapabilitiesClearOnVerifiedSnapshot() async throws {
+        let h = try await harness()
+        await h.service.setError(SieveAccountServiceError.unsupportedCapabilities(missing: ["vacation"]))
+        await h.model.refresh()
+        XCTAssertFalse(h.model.isOutOfOfficeAvailable)
+        await h.service.setError(nil)
+        await h.service.enqueue(snapshot(.off))
+        await h.model.refresh()
+        XCTAssertTrue(h.model.isOutOfOfficeAvailable)
+        XCTAssertTrue(h.model.missingCapabilities.isEmpty)
     }
 
     // MARK: Mutations never infer success

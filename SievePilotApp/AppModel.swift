@@ -51,7 +51,8 @@ final class AppModel: ObservableObject {
     @Published var userFacingError: String?
     @Published private(set) var hasUnresolvedConflict = false
     @Published private(set) var ruleOrderingAcknowledged = false
-    @Published private(set) var serverLacksRequiredCapabilities = false
+    /// Extensions the server reported missing when the core failed closed before returning a snapshot.
+    @Published private(set) var reportedMissingCapabilities: [String] = []
     @Published var isShowingSettings = false
 
     // Out-of-office form. Expiry is a wall-clock time in a named zone; it is resolved to an instant on save.
@@ -157,7 +158,7 @@ final class AppModel: ObservableObject {
                 guard isCurrent(token) else { return }
                 persistedAccount = account
                 verifiedSnapshot = nil
-                serverLacksRequiredCapabilities = false
+                reportedMissingCapabilities = []
                 if let account { populateForm(from: account); operationState = .stale }
                 else { operationState = .idle }
             } catch is CancellationError {
@@ -192,7 +193,7 @@ final class AppModel: ObservableObject {
                 persistedAccount = configuration
                 verifiedSnapshot = nil
                 hasUnresolvedConflict = false
-                serverLacksRequiredCapabilities = false
+                reportedMissingCapabilities = []
                 if isCurrent(token) {
                     password = ""
                     userFacingError = nil
@@ -239,7 +240,7 @@ final class AppModel: ObservableObject {
                 verifiedSnapshot = nil
                 discoveryPreview = nil
                 hasUnresolvedConflict = false
-                serverLacksRequiredCapabilities = false
+                reportedMissingCapabilities = []
                 isShowingSettings = false
                 if isCurrent(token) {
                     password = ""
@@ -418,11 +419,14 @@ final class AppModel: ObservableObject {
     }
 
     var missingCapabilities: [String] {
+        if !reportedMissingCapabilities.isEmpty {
+            return Self.requiredExtensions.filter(reportedMissingCapabilities.contains)
+        }
         guard let capabilities = verifiedSnapshot?.capabilities, capabilities.isAuthoritative else { return [] }
         return Self.requiredExtensions.filter { !capabilities.supportsSieveExtension($0) }
     }
 
-    var isOutOfOfficeAvailable: Bool { !serverLacksRequiredCapabilities && missingCapabilities.isEmpty }
+    var isOutOfOfficeAvailable: Bool { missingCapabilities.isEmpty }
 
     var capabilityLimitations: [String] {
         var result: [String] = []
@@ -433,9 +437,6 @@ final class AppModel: ObservableObject {
         let scheduling = missing.filter { $0 != "vacation" }
         if !scheduling.isEmpty {
             result.append("Scheduled expiry is unavailable: this server does not advertise the Sieve extension(s): \(scheduling.joined(separator: ", ")). SievePilot offers no local fallback, so out of office cannot be enabled.")
-        }
-        if serverLacksRequiredCapabilities && missing.isEmpty {
-            result.append("Out of office is unavailable: this server did not advertise all required Sieve extensions (vacation, date, relational). Scheduled expiry has no local fallback.")
         }
         return result
     }
@@ -577,7 +578,7 @@ final class AppModel: ObservableObject {
     private func adopt(_ snapshot: VerifiedAccountSnapshot) {
         verifiedSnapshot = snapshot
         hasUnresolvedConflict = false
-        serverLacksRequiredCapabilities = false
+        reportedMissingCapabilities = []
         guard !formIsDirty else { return }
         switch snapshot.outOfOfficeState {
         case .on(let configuration), .expiryPassedServerClockApplies(let configuration):
@@ -639,9 +640,12 @@ final class AppModel: ObservableObject {
     }
 
     private func finishFailure(_ token: Int, error: Error, fallback: String) {
-        if case SieveAccountServiceError.unsupportedCapabilities = error, isCurrent(token) {
-            serverLacksRequiredCapabilities = true
-            finishFailure(token, message: "This server does not advertise every Sieve extension SievePilot requires (vacation, date, relational).")
+        if case SieveAccountServiceError.unsupportedCapabilities(let reported) = error, isCurrent(token) {
+            let known = Self.requiredExtensions.filter(reported.contains)
+            // An empty or unrecognised payload still fails closed and names every requirement.
+            let missing = known.isEmpty ? Self.requiredExtensions : known
+            reportedMissingCapabilities = missing
+            finishFailure(token, message: "This server does not advertise the Sieve extension(s) SievePilot requires: \(missing.joined(separator: ", ")).")
         } else {
             finishFailure(token, message: fallback)
         }

@@ -26,7 +26,9 @@ public enum AccountMutationOutcome: Equatable, Sendable {
 }
 
 public enum SieveAccountServiceError: Error, Equatable, Sendable {
-    case unsupportedCapabilities
+    /// The server lacks required Sieve extensions. `missing` names them in `vacation`, `date`, `relational`
+    /// order (all three when the capability list is not authoritative).
+    case unsupportedCapabilities(missing: [String])
     case nameGenerationFailed
     case manifest
 }
@@ -150,11 +152,14 @@ public actor SieveAccountService {
         throw SieveAccountServiceError.nameGenerationFailed
     }
 
+    private static let requiredExtensions = ["vacation", "date", "relational"]
+
     private static func requireCapabilities(_ capabilities: ManageSieveCapabilities) throws {
-        guard capabilities.isAuthoritative,
-              ["vacation", "date", "relational"].allSatisfy(capabilities.supportsSieveExtension) else {
-            throw SieveAccountServiceError.unsupportedCapabilities
+        guard capabilities.isAuthoritative else {
+            throw SieveAccountServiceError.unsupportedCapabilities(missing: requiredExtensions)
         }
+        let missing = requiredExtensions.filter { !capabilities.supportsSieveExtension($0) }
+        guard missing.isEmpty else { throw SieveAccountServiceError.unsupportedCapabilities(missing: missing) }
     }
 
     private static func verifiedState(script: Data?, accountID: AccountID, now: Date) -> VerifiedOutOfOfficeState {

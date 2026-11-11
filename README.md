@@ -52,7 +52,7 @@ SievePilot requires an authoritative post-TLS ManageSieve capability list that i
 
 - Without `vacation`, out of office is unavailable.
 - Without both `date` and `relational`, scheduled expiry is unavailable. SievePilot offers no local fallback because an expiry that depends on your Mac being awake would be unreliable.
-- The menu lists the missing capabilities instead of showing unexplained disabled controls. If a server rejects the account because required extensions are missing, the menu names all three requirements, because the server's exact shortfall is not reported.
+- The menu names the missing extensions instead of showing unexplained disabled controls. When a server lacks any required extension, SievePilot refuses to read or change the script, reports exactly which extensions are missing, and never guesses a verified state.
 
 ### Safe script versions and backups
 
