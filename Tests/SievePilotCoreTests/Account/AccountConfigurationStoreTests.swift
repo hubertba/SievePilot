@@ -124,6 +124,22 @@ final class AccountConfigurationStoreTests: XCTestCase {
         catch { XCTAssertEqual(error as? AccountConfigurationStoreError, .unsupportedVersion(2)) }
     }
 
+    func testSuccessfulCommitHasNoFalliblePostReplacementWork() async throws {
+        let base = try temporaryDirectory()
+        let initialStore = AccountConfigurationStore(baseDirectory: base)
+        try await initialStore.save(try configuration(username: "before"))
+        var attributeCalls = 0
+        let store = AccountConfigurationStore(baseDirectory: base, replace: AccountConfigurationStore.atomicReplace, setAttributes: { attributes, path in
+            attributeCalls += 1
+            if attributeCalls == 3 { throw CocoaError(.fileWriteNoPermission) }
+            try FileManager.default.setAttributes(attributes, ofItemAtPath: path)
+        })
+        try await store.save(try configuration(username: "after"))
+        XCTAssertEqual(attributeCalls, 2)
+        let loaded = try await initialStore.load()
+        XCTAssertEqual(loaded?.username, "after")
+    }
+
     func testAtomicReplacementFailurePreservesPreviousBytes() async throws {
         let base = try temporaryDirectory()
         let initialStore = AccountConfigurationStore(baseDirectory: base)
@@ -155,10 +171,38 @@ final class AccountConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(restoredPassword, Data("old-password".utf8))
 
         let newID = AccountID(rawValue: UUID())
-        do { try await coordinator.save(configuration: try configuration(id: newID), password: Data("new".utf8)); XCTFail() }
+        let emptySettings = MemoryConfigurationStore()
+        await emptySettings.failSave(CocoaError(.fileWriteUnknown))
+        let initialSaveCoordinator = AccountPersistenceCoordinator(configurationStore: emptySettings, credentialStore: credentials)
+        do { try await initialSaveCoordinator.save(configuration: try configuration(id: newID), password: Data("new".utf8)); XCTFail() }
         catch { XCTAssertEqual(error as? AccountPersistenceError, .settingsSaveFailed) }
         let removedNewPassword = try await credentials.read(accountID: newID)
         XCTAssertNil(removedNewPassword)
+    }
+
+    func testCoordinatorRejectsAccountIDChangesAndMismatchedDeleteWithoutOrphans() async throws {
+        let old = try configuration()
+        let settings = MemoryConfigurationStore(old)
+        let credentials = MemoryCredentialStore()
+        await credentials.set(Data("old".utf8), for: accountID)
+        let coordinator = AccountPersistenceCoordinator(configurationStore: settings, credentialStore: credentials)
+        let otherID = AccountID(rawValue: UUID())
+
+        do { try await coordinator.save(configuration: try configuration(id: otherID), password: Data("new".utf8)); XCTFail() }
+        catch { XCTAssertEqual(error as? AccountPersistenceError, .accountIDMismatch) }
+        let settingsAfterSave = try await settings.load()
+        let oldPasswordAfterSave = try await credentials.read(accountID: accountID)
+        let newPasswordAfterSave = try await credentials.read(accountID: otherID)
+        XCTAssertEqual(settingsAfterSave?.accountID, accountID)
+        XCTAssertEqual(oldPasswordAfterSave, Data("old".utf8))
+        XCTAssertNil(newPasswordAfterSave)
+
+        do { try await coordinator.delete(accountID: otherID); XCTFail() }
+        catch { XCTAssertEqual(error as? AccountPersistenceError, .accountIDMismatch) }
+        let settingsAfterDelete = try await settings.load()
+        let oldPasswordAfterDelete = try await credentials.read(accountID: accountID)
+        XCTAssertEqual(settingsAfterDelete?.accountID, accountID)
+        XCTAssertEqual(oldPasswordAfterDelete, Data("old".utf8))
     }
 
     func testCoordinatorReportsRollbackFailureAndDeletesSettingsFirst() async throws {

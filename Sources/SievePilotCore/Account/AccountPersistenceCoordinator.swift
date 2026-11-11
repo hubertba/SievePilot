@@ -7,6 +7,8 @@ public protocol CredentialStoring: Sendable {
 }
 
 public enum AccountPersistenceError: Error, Equatable, Sendable {
+    case settingsLoadFailed
+    case accountIDMismatch
     case credentialReadFailed
     case credentialWriteFailed
     case settingsSaveFailed
@@ -25,6 +27,12 @@ public actor AccountPersistenceCoordinator {
     }
 
     public func save(configuration: AccountConfiguration, password: Data) async throws {
+        let existing: AccountConfiguration?
+        do { existing = try await configurationStore.load() }
+        catch { throw AccountPersistenceError.settingsLoadFailed }
+        guard existing == nil || existing?.accountID == configuration.accountID else {
+            throw AccountPersistenceError.accountIDMismatch
+        }
         let priorCredential: Data?
         do { priorCredential = try await credentialStore.read(accountID: configuration.accountID) }
         catch { throw AccountPersistenceError.credentialReadFailed }
@@ -47,6 +55,12 @@ public actor AccountPersistenceCoordinator {
     }
 
     public func delete(accountID: AccountID) async throws {
+        let existing: AccountConfiguration?
+        do { existing = try await configurationStore.load() }
+        catch { throw AccountPersistenceError.settingsLoadFailed }
+        guard existing == nil || existing?.accountID == accountID else {
+            throw AccountPersistenceError.accountIDMismatch
+        }
         do { try await configurationStore.delete() }
         catch { throw AccountPersistenceError.settingsDeleteFailed }
         do { try await credentialStore.delete(accountID: accountID) }
