@@ -11,6 +11,7 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
     var conflictOnSecondList: (String, Data)?
     var setActiveError: Error?
     var putError: Error?
+    var checkError: Error?
     var corruptReadBack = false
 
     init(capabilities: ManageSieveCapabilities, scripts: [String: Data] = [:], active: String? = nil) {
@@ -30,7 +31,9 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
         return scripts[name] ?? Data()
     }
     func checkScript(_ script: Data, timeout: Duration?) async throws -> ManageSieveCommandResult {
-        events.append("check"); return .init(responseCode: nil, message: nil)
+        events.append("check")
+        if let checkError { throw checkError }
+        return .init(responseCode: nil, message: nil)
     }
     func putScript(name: String, script: Data, timeout: Duration?) async throws -> ManageSieveCommandResult {
         events.append("put:\(name)")
@@ -263,10 +266,13 @@ final class SieveAccountServiceTests: XCTestCase {
             let interruptedOutcome = try await service(interrupted).applyOutOfOffice(account: account(), configuration: configuration())
             XCTAssertEqual(interruptedOutcome, .unknown)
         }
+        // A definite SETACTIVE refusal is an activation failure, distinct from validation and from unknown.
         let rejected = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
         await rejected.setSetActiveError(ManageSieveClientError.serverNo)
         do { _ = try await service(rejected).applyOutOfOffice(account: account(), configuration: configuration()); XCTFail() }
-        catch { XCTAssertEqual(error as? ManageSieveClientError, .serverNo) }
+        catch { XCTAssertEqual(error as? SieveAccountServiceError, .activationRejected) }
+        let stillActive = await rejected.active
+        XCTAssertEqual(stillActive, "base")
 
         let manifests = MemoryManifestStore(); await manifests.setFailPhase(.verifiedActive)
         let activated = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
@@ -297,14 +303,51 @@ final class SieveAccountServiceTests: XCTestCase {
         }
     }
 
-    func testPutServerNoPropagatesAndLeavesPreparedRollbackRecord() async throws {
+    func testPutServerNoIsValidationFailureAndLeavesPreparedRollbackRecord() async throws {
         let manifests = MemoryManifestStore()
         let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": Data("keep;\n".utf8)], active: "base")
         await session.setPutError(ManageSieveClientError.serverNo)
         do { _ = try await service(session, manifests: manifests).applyOutOfOffice(account: account(), configuration: configuration()); XCTFail() }
-        catch { XCTAssertEqual(error as? ManageSieveClientError, .serverNo) }
+        catch { XCTAssertEqual(error as? SieveAccountServiceError, .scriptRejected) }
         let records = await manifests.records
         XCTAssertEqual(records.map(\.phase), [.prepared])
+        let events = await session.events
+        XCTAssertFalse(events.contains { $0.hasPrefix("active:") })
+    }
+
+    func testCheckScriptRejectionIsValidationFailureBeforeAnyUploadOrManifestRecord() async throws {
+        let manifests = MemoryManifestStore()
+        let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": Data("keep;\n".utf8)], active: "base")
+        await session.setCheckError(ManageSieveClientError.serverNo)
+        do { _ = try await service(session, manifests: manifests).applyOutOfOffice(account: account(), configuration: configuration()); XCTFail() }
+        catch { XCTAssertEqual(error as? SieveAccountServiceError, .scriptRejected) }
+        let events = await session.events
+        XCTAssertFalse(events.contains { $0.hasPrefix("put:") || $0.hasPrefix("active:") })
+        let records = await manifests.records
+        XCTAssertTrue(records.isEmpty)
+    }
+
+    func testQuotaRejectionStaysDistinctFromValidationAndNeverActivates() async throws {
+        for stage in ["check", "put"] {
+            let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": Data("keep;\n".utf8)], active: "base")
+            if stage == "check" { await session.setCheckError(ManageSieveClientError.quotaExceeded) }
+            else { await session.setPutError(ManageSieveClientError.quotaExceeded) }
+            do { _ = try await service(session).applyOutOfOffice(account: account(), configuration: configuration()); XCTFail(stage) }
+            catch { XCTAssertEqual(error as? SieveAccountServiceError, .quotaExceeded, stage) }
+            let events = await session.events
+            XCTAssertFalse(events.contains { $0.hasPrefix("active:") }, stage)
+            let active = await session.active
+            XCTAssertEqual(active, "base", stage)
+        }
+    }
+
+    func testIndefiniteUploadFailuresKeepTheirTransportClassification() async throws {
+        for error in [ManageSieveClientError.transport, .timeout, .serverBye] {
+            let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": Data("keep;\n".utf8)], active: "base")
+            await session.setPutError(error)
+            do { _ = try await service(session).applyOutOfOffice(account: account(), configuration: configuration()); XCTFail() }
+            catch let thrown { XCTAssertEqual(thrown as? ManageSieveClientError, error) }
+        }
     }
 }
 
@@ -312,6 +355,7 @@ private extension ServiceSession {
     func setConflictOnSecondList(name: String, script: Data) { conflictOnSecondList = (name, script) }
     func setSetActiveError(_ error: Error?) { setActiveError = error }
     func setPutError(_ error: Error?) { putError = error }
+    func setCheckError(_ error: Error?) { checkError = error }
     func setCorruptReadBack(_ value: Bool) { corruptReadBack = value }
 }
 

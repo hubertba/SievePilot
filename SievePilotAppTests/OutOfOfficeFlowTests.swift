@@ -394,6 +394,57 @@ final class OutOfOfficeFlowTests: XCTestCase {
         XCTAssertNil(h.model.userFacingError)
     }
 
+    func testValidationQuotaAndActivationRejectionsStayDistinctAndNeverReportSuccess() async throws {
+        let fallback = "Unable to apply the out-of-office change. Refresh to verify the server state."
+        let cases: [(SieveAccountServiceError, AppModel.FailureCategory)] = [
+            (.scriptRejected, .validation), (.quotaExceeded, .quota), (.activationRejected, .activation),
+            (.manifest, .localRecord)
+        ]
+        var messages: Set<String> = []
+        for (error, category) in cases {
+            let h = try await harness()
+            await h.service.enqueue(snapshot(.off))
+            await h.model.refresh()
+            fillValid(h.model)
+            await h.service.enqueueOutcome(.failure(error))
+            await h.model.saveAndActivate()
+            XCTAssertEqual(h.model.operationState, .error, "\(error)")
+            XCTAssertEqual(h.model.outOfOfficeStatus, .unknown, "\(error)")
+            XCTAssertNil(h.model.verifiedAt, "\(error)")
+            let message = try XCTUnwrap(h.model.userFacingError, "\(error)")
+            XCTAssertEqual(message, category.message, "\(error)")
+            XCTAssertNotEqual(message, fallback, "\(error)")
+            XCTAssertFalse(message.contains("Back soon"), "Script content must not appear in errors")
+            messages.insert(message)
+
+            // Disabling goes through the same mapping.
+            h.model.acknowledgeError()
+            await h.service.enqueueOutcome(.failure(error))
+            await h.model.disable()
+            XCTAssertEqual(h.model.userFacingError, category.message, "\(error)")
+        }
+        XCTAssertEqual(messages.count, cases.count)
+
+        // The conflict and unverified outcomes keep their own wording, separate from every rejection above.
+        let h = try await harness()
+        fillValid(h.model)
+        await h.service.enqueueOutcome(.success(.conflict))
+        await h.model.saveAndActivate()
+        let conflict = try XCTUnwrap(h.model.userFacingError)
+        h.model.acknowledgeError()
+        await h.service.enqueueOutcome(.success(.unknown))
+        await h.model.saveAndActivate()
+        let unverified = try XCTUnwrap(h.model.userFacingError)
+        XCTAssertNotEqual(conflict, unverified)
+        XCTAssertFalse(messages.contains(conflict))
+        XCTAssertFalse(messages.contains(unverified))
+        // An authentication failure while applying is reported as such, not as an apply failure.
+        h.model.acknowledgeError()
+        await h.service.enqueueOutcome(.failure(ManageSieveSessionFactoryError.authenticationRejected))
+        await h.model.saveAndActivate()
+        XCTAssertEqual(h.model.userFacingError, AppModel.FailureCategory.authenticationRejected.message)
+    }
+
     func testCancellationDuringActivationIsUnknown() async throws {
         let h = try await harness()
         fillValid(h.model)

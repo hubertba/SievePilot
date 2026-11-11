@@ -31,6 +31,9 @@ public enum ManageSieveSessionFactoryError: Error, Equatable, Sendable {
     case missingCredential
     case invalidCredentialEncoding
     case unsupportedAuthentication
+    /// The server answered `NO` to `AUTHENTICATE`: the credentials were refused. Kept apart from a script
+    /// command's `ManageSieveClientError.serverNo` so callers can tell the two rejections apart.
+    case authenticationRejected
 }
 
 internal protocol ManageSieveClientSession: Sendable {
@@ -102,12 +105,20 @@ public struct ManageSieveSessionFactory: ManageSieveSessionProviding, ManageSiev
         do {
             let advertised = try await client.connectAndStartTLS(
                 identity: .init(referenceIdentifiers: serviceEndpoint.referenceIdentifiers), timeout: nil)
-            if advertised.supportsSASLMechanism("PLAIN") {
-                try await client.authenticatePlain(username: account.username, password: password, timeout: nil)
-            } else if advertised.supportsSASLMechanism("LOGIN") {
-                try await client.authenticateLogin(username: account.username, password: password, timeout: nil)
-            } else {
-                throw ManageSieveSessionFactoryError.unsupportedAuthentication
+            do {
+                if advertised.supportsSASLMechanism("PLAIN") {
+                    try await client.authenticatePlain(username: account.username, password: password, timeout: nil)
+                } else if advertised.supportsSASLMechanism("LOGIN") {
+                    try await client.authenticateLogin(username: account.username, password: password, timeout: nil)
+                } else {
+                    throw ManageSieveSessionFactoryError.unsupportedAuthentication
+                }
+            } catch let error as ManageSieveClientError where error == .serverNo {
+                // A refused AUTHENTICATE leaves the client encrypted with its capabilities intact. A NO to the
+                // capability refresh after a successful AUTHENTICATE closes the client and clears them; that
+                // is a protocol failure, not a credential rejection.
+                guard await client.capabilities != nil else { throw error }
+                throw ManageSieveSessionFactoryError.authenticationRejected
             }
             guard let capabilities = await client.capabilities, capabilities.isAuthoritative else {
                 throw ManageSieveClientError.parse

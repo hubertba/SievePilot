@@ -207,7 +207,7 @@ final class AppModel: ObservableObject {
             } catch SetupFormError.missingPassword {
                 finishFailure(token, message: "Enter your password.")
             } catch {
-                finishFailure(token, message: "Unable to verify and save this account.")
+                finishFailure(token, error: error, fallback: "Unable to verify and save this account.")
             }
         }
     }
@@ -647,7 +647,8 @@ final class AppModel: ObservableObject {
             reportedMissingCapabilities = missing
             finishFailure(token, message: "This server does not advertise the Sieve extension(s) SievePilot requires: \(missing.joined(separator: ", ")).")
         } else {
-            finishFailure(token, message: fallback)
+            // Only the error's type and case select the text; nothing carried by the error is displayed.
+            finishFailure(token, message: FailureCategory(error)?.message ?? fallback)
         }
     }
 
@@ -684,6 +685,125 @@ final class AppModel: ObservableObject {
             usesAutomaticDiscovery = false
             manualHost = host
             manualPort = String(port)
+        }
+    }
+}
+
+extension AppModel {
+    /// Failure categories the design requires to stay distinct for the user. Capability, conflict, and
+    /// verification failures are reported through their own paths (the missing-extension message and the
+    /// `.conflict` / `.unknown` mutation outcomes); the categories here cover typed errors thrown by the core.
+    ///
+    /// Each category has one fixed message. Messages never include server text, host or account names,
+    /// script contents, or secrets: they are chosen from the error's type and case alone.
+    enum FailureCategory: CaseIterable, Equatable, Sendable {
+        case discoveryNoService
+        case discoveryFailed
+        case network
+        case timeout
+        case tlsTrust
+        case tlsIdentity
+        case tlsUnavailable
+        case authenticationRejected
+        case authenticationUnsupported
+        case credentialMissing
+        case credentialUnreadable
+        case credentialInvalid
+        case serverProtocol
+        case validation
+        case quota
+        case activation
+        case localRecord
+        case accountStorage
+
+        var message: String {
+            switch self {
+            case .discoveryNoService:
+                "No ManageSieve server is published for this email domain. Turn off \"Discover server automatically\" and enter the server yourself."
+            case .discoveryFailed:
+                "Automatic server discovery failed. Check the network connection, or turn off \"Discover server automatically\" and enter the server yourself."
+            case .network:
+                "The connection to the server failed. Check the network connection and the server settings."
+            case .timeout:
+                "The server did not respond in time. Check the network connection and the server settings."
+            case .tlsTrust:
+                "The server's certificate is not trusted by this Mac, so SievePilot did not sign in."
+            case .tlsIdentity:
+                "The server's certificate does not match the name expected for this account, so SievePilot did not sign in. If your provider uses a different server name, turn off \"Discover server automatically\" and enter that name."
+            case .tlsUnavailable:
+                "A secure (TLS) connection to the server could not be established, so SievePilot did not sign in."
+            case .authenticationRejected:
+                "The server rejected the username or password."
+            case .authenticationUnsupported:
+                "The server does not offer a sign-in method SievePilot supports (PLAIN or LOGIN)."
+            case .credentialMissing:
+                "No saved password was found for this account. Open Settings and enter the password again."
+            case .credentialUnreadable:
+                "The saved password could not be read from the Keychain."
+            case .credentialInvalid:
+                "The username or password contains characters that cannot be sent to the server."
+            case .serverProtocol:
+                "The server sent a response SievePilot could not interpret."
+            case .validation:
+                "The server rejected the updated script, so nothing was activated."
+            case .quota:
+                "The server's script storage quota is exhausted, so nothing was activated. Delete unused scripts on the server and try again."
+            case .activation:
+                "The server refused to activate the updated script. Refresh to verify the server state."
+            case .localRecord:
+                "SievePilot could not record the change on this Mac, so nothing was uploaded."
+            case .accountStorage:
+                "The account was verified, but saving it on this Mac failed."
+            }
+        }
+
+        /// Classifies a typed core error. Returns `nil` for anything unrecognised so the caller's generic,
+        /// equally redacted fallback is used; untyped errors are never described.
+        init?(_ error: Error) {
+            switch error {
+            case let error as SieveServiceDiscoveryError:
+                switch error {
+                case .noRecords, .serviceUnavailable: self = .discoveryNoService
+                case .invalidEmailAddress, .invalidRecord, .weightOverflow, .invalidRandomValue,
+                     .invalidConfiguration, .responseLimitExceeded, .timedOut, .dnsService:
+                    self = .discoveryFailed
+                }
+            case let error as ManageSieveSessionFactoryError:
+                switch error {
+                case .missingCredential: self = .credentialMissing
+                case .invalidCredentialEncoding: self = .credentialInvalid
+                case .unsupportedAuthentication: self = .authenticationUnsupported
+                case .authenticationRejected: self = .authenticationRejected
+                }
+            case is KeychainCredentialStoreError:
+                self = .credentialUnreadable
+            case let error as ManageSieveClientError:
+                switch error {
+                case .tlsTrustFailed: self = .tlsTrust
+                case .tlsIdentityFailed: self = .tlsIdentity
+                case .tls, .missingStartTLS: self = .tlsUnavailable
+                case .transport, .unexpectedEOF, .serverBye: self = .network
+                case .timeout: self = .timeout
+                case .parse: self = .serverProtocol
+                case .unsupportedMechanism: self = .authenticationUnsupported
+                case .invalidCredentials: self = .credentialInvalid
+                case .invalidState, .operationInProgress, .cancelled, .invalidIdentity, .invalidScriptName,
+                     .invalidScript, .serverNo, .quotaExceeded:
+                    return nil
+                }
+            case let error as SieveAccountServiceError:
+                switch error {
+                case .scriptRejected: self = .validation
+                case .quotaExceeded: self = .quota
+                case .activationRejected: self = .activation
+                case .manifest: self = .localRecord
+                case .unsupportedCapabilities, .nameGenerationFailed: return nil
+                }
+            case is AccountPersistenceError:
+                self = .accountStorage
+            default:
+                return nil
+            }
         }
     }
 }

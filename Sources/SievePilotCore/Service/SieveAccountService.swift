@@ -31,6 +31,12 @@ public enum SieveAccountServiceError: Error, Equatable, Sendable {
     case unsupportedCapabilities(missing: [String])
     case nameGenerationFailed
     case manifest
+    /// `CHECKSCRIPT` or `PUTSCRIPT` answered `NO`: the server refused the candidate. Nothing was activated.
+    case scriptRejected
+    /// `CHECKSCRIPT` or `PUTSCRIPT` answered `NO` with a `QUOTA` response code. Nothing was activated.
+    case quotaExceeded
+    /// `SETACTIVE` answered `NO`: a definite refusal, so this operation did not change the active script.
+    case activationRejected
 }
 
 public actor SieveAccountService {
@@ -96,7 +102,8 @@ public actor SieveAccountService {
             // command (§1.7). An authoritative capability list always carries VERSION, so this runs for
             // every server the client accepts.
             if capabilities.containsCapability("VERSION") {
-                _ = try await session.checkScript(candidate, timeout: nil)
+                do { _ = try await session.checkScript(candidate, timeout: nil) }
+                catch { throw Self.candidateRejection(error) }
             }
             let allNames = Set(initialEntries.map(\.name))
             let name = try Self.uniqueName(accountID: account.accountID, existing: allNames, randomBytes: randomBytes)
@@ -107,7 +114,8 @@ public actor SieveAccountService {
             do { try await manifestStore.save(prepared) }
             catch { throw SieveAccountServiceError.manifest }
 
-            _ = try await session.putScript(name: name, script: candidate, timeout: nil)
+            do { _ = try await session.putScript(name: name, script: candidate, timeout: nil) }
+            catch { throw Self.candidateRejection(error) }
             do { try await manifestStore.save(prepared.withPhase(.uploaded)) }
             catch { return .unknown }
 
@@ -123,6 +131,7 @@ public actor SieveAccountService {
             do { try await session.setActive(name: name, timeout: nil) }
             catch {
                 if Self.isAmbiguous(error) { return .unknown }
+                if Self.isDefiniteRejection(error) { throw SieveAccountServiceError.activationRejected }
                 throw error
             }
             do {
@@ -182,6 +191,20 @@ public actor SieveAccountService {
 
     internal static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Names the stage of a definite `NO` to `CHECKSCRIPT` or `PUTSCRIPT`; every other error passes through.
+    private static func candidateRejection(_ error: Error) -> Error {
+        switch error as? ManageSieveClientError {
+        case .serverNo: return SieveAccountServiceError.scriptRejected
+        case .quotaExceeded: return SieveAccountServiceError.quotaExceeded
+        default: return error
+        }
+    }
+
+    private static func isDefiniteRejection(_ error: Error) -> Bool {
+        guard let error = error as? ManageSieveClientError else { return false }
+        return error == .serverNo || error == .quotaExceeded
     }
 
     private static func isAmbiguous(_ error: Error) -> Bool {

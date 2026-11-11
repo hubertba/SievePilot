@@ -138,6 +138,29 @@ import Testing
         #expect(await transport.assertComplete())
     }
 
+    @Test(arguments: ["QUOTA", "QUOTA/MAXSCRIPTS", "QUOTA/MAXSIZE", "quota/maxsize"])
+    func quotaRejectionIsDistinctFromOtherRejectionsRedactedAndRecoverable(code: String) async throws {
+        let put = Data("PUTSCRIPT \"name\" {1+}\r\nx\r\n".utf8)
+        let logger = RecordingManageSieveLogger()
+        let (transport, client) = try await client([
+            .write(put), .read(Data("NO (\(code)) \"SENSITIVE_SERVER_MESSAGE_42\"\r\n".utf8)),
+            .write(put), .read(Data("NO (NONEXISTENT) \"SENSITIVE_SERVER_MESSAGE_42\"\r\n".utf8)),
+            .write(put), .read(Data("NO \"QUOTA appears only in SENSITIVE_SERVER_MESSAGE_42\"\r\n".utf8)),
+            .write(Data("LISTSCRIPTS\r\n".utf8)), .read(Data("OK\r\n".utf8)),
+        ], logger: logger)
+        var descriptions = ""
+        for expected in [ManageSieveClientError.quotaExceeded, .serverNo, .serverNo] {
+            do { _ = try await client.putScript(name: "name", script: Data("x".utf8)); Issue.record("Expected \(expected)") }
+            catch { descriptions += String(reflecting: error); #expect(error as? ManageSieveClientError == expected) }
+            #expect(await client.state == .authenticated)
+        }
+        #expect(try await client.listScripts().isEmpty)
+        let reported = descriptions + logger.events.map { String(describing: $0) }.joined()
+        #expect(!reported.contains("SENSITIVE_SERVER_MESSAGE_42"))
+        #expect(await transport.closeCount == 0)
+        #expect(await transport.assertComplete())
+    }
+
     @Test func quotedStringBoundaryAndLiteralNames() async throws {
         let quoted = String(repeating: "a", count: 1022)
         let literal = String(repeating: "b", count: 1023)

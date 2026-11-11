@@ -74,7 +74,8 @@ actor AppSessionProvider: ManageSieveCandidateSessionProviding {
         let gate = nextGate; nextGate = nil
         await gate?.wait()
         if let error { throw error }
-        if let accepted, accepted != candidate { throw ManageSieveClientError.serverNo }
+        // The production factory reports a refused AUTHENTICATE as its own error, never as a script NO.
+        if let accepted, accepted != candidate { throw ManageSieveSessionFactoryError.authenticationRejected }
         return try await operation(AppSession())
     }
     func callCount() -> Int { calls.count }
@@ -328,6 +329,159 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(message.contains("hunter2"))
     }
 
+    // MARK: Failure categories
+
+    private static let testAndSaveFallback = "Unable to verify and save this account."
+    private static let refreshFallback = "Unable to verify the server state."
+
+    /// Typed core errors and the category each must surface as. `dnsService` carries a payload on purpose.
+    private static let categorizedFailures: [(error: Error, category: AppModel.FailureCategory)] = [
+        (SieveServiceDiscoveryError.noRecords, .discoveryNoService),
+        (SieveServiceDiscoveryError.serviceUnavailable, .discoveryNoService),
+        (SieveServiceDiscoveryError.timedOut, .discoveryFailed),
+        (SieveServiceDiscoveryError.dnsService(-65_537), .discoveryFailed),
+        (ManageSieveClientError.tlsTrustFailed, .tlsTrust),
+        (ManageSieveClientError.tlsIdentityFailed, .tlsIdentity),
+        (ManageSieveClientError.tls, .tlsUnavailable),
+        (ManageSieveClientError.missingStartTLS, .tlsUnavailable),
+        (ManageSieveSessionFactoryError.authenticationRejected, .authenticationRejected),
+        (ManageSieveSessionFactoryError.unsupportedAuthentication, .authenticationUnsupported),
+        (ManageSieveSessionFactoryError.missingCredential, .credentialMissing),
+        (KeychainCredentialStoreError.invalidData, .credentialUnreadable),
+        (ManageSieveSessionFactoryError.invalidCredentialEncoding, .credentialInvalid),
+        (ManageSieveClientError.transport, .network),
+        (ManageSieveClientError.unexpectedEOF, .network),
+        (ManageSieveClientError.serverBye, .network),
+        (ManageSieveClientError.timeout, .timeout),
+        (ManageSieveClientError.parse, .serverProtocol),
+    ]
+
+    private func assertRedacted(_ message: String, file: StaticString = #filePath, line: UInt = #line) {
+        for secret in ["hunter2", "user@example.org", "mail.example.org", "65537", "4190"] {
+            XCTAssertFalse(message.contains(secret), "Message leaked \(secret)", file: file, line: line)
+        }
+    }
+
+    func testEveryFailureCategoryHasItsOwnFixedMessage() {
+        let messages = AppModel.FailureCategory.allCases.map(\.message)
+        XCTAssertEqual(Set(messages).count, messages.count, "Categories must not share a message")
+        for message in messages {
+            XCTAssertFalse(message.isEmpty)
+            XCTAssertNotEqual(message, Self.testAndSaveFallback)
+            XCTAssertNotEqual(message, Self.refreshFallback)
+        }
+        // The six categories the review called out must each be separately recognisable.
+        let required: [AppModel.FailureCategory] = [.discoveryNoService, .tlsTrust, .tlsIdentity,
+                                                    .authenticationRejected, .credentialMissing, .network]
+        XCTAssertEqual(Set(required.map(\.message)).count, required.count)
+        // Untyped errors and a bare script NO are never classified, so nothing of theirs can be shown.
+        XCTAssertNil(AppModel.FailureCategory(NSError(domain: "secret-sasl-payload", code: 7)))
+        XCTAssertNil(AppModel.FailureCategory(ManageSieveClientError.serverNo))
+    }
+
+    func testTestAndSaveReportsEachFailureCategoryDistinctlyRedactedAndNeverPersists() async throws {
+        var seen: [AppModel.FailureCategory: String] = [:]
+        for (error, category) in Self.categorizedFailures {
+            let persistence = AppPersistence(), sessions = AppSessionProvider()
+            await sessions.setError(error)
+            let model = model(persistence: persistence, sessions: sessions)
+            fillManual(model, password: "hunter2")
+            await model.testAndSave()
+            XCTAssertEqual(model.operationState, .error, "\(error)")
+            let message = try XCTUnwrap(model.userFacingError, "\(error)")
+            XCTAssertEqual(message, category.message, "\(error)")
+            XCTAssertNotEqual(message, Self.testAndSaveFallback, "\(error)")
+            assertRedacted(message)
+            XCTAssertNil(model.persistedAccount, "\(error)")
+            let saveCount = await persistence.saveCount()
+            XCTAssertEqual(saveCount, 0, "\(error)")
+            XCTAssertEqual(model.password, "hunter2", "A failed test keeps the form password for a retry")
+            seen[category] = message
+        }
+        XCTAssertEqual(Set(seen.values).count, seen.count, "Distinct categories must show distinct messages")
+    }
+
+    func testTestAndSaveDiscoveryFailurePointsToManualEntryBeforeAnyConnection() async throws {
+        for (error, category) in [(SieveServiceDiscoveryError.noRecords, AppModel.FailureCategory.discoveryNoService),
+                                  (.timedOut, .discoveryFailed)] {
+            let persistence = AppPersistence(), sessions = AppSessionProvider(), discovery = AppDiscovery()
+            await discovery.setError(error)
+            let model = model(persistence: persistence, discovery: discovery, sessions: sessions)
+            model.emailAddress = "user@example.org"; model.username = "user"; model.password = "hunter2"
+            await model.testAndSave()
+            XCTAssertEqual(model.operationState, .error)
+            let message = try XCTUnwrap(model.userFacingError)
+            XCTAssertEqual(message, category.message)
+            XCTAssertTrue(message.contains("Discover server automatically"), "The user needs the hint to switch to manual")
+            assertRedacted(message)
+            XCTAssertNil(model.discoveryPreview)
+            let callCount = await sessions.callCount()
+            let saveCount = await persistence.saveCount()
+            XCTAssertEqual(callCount, 0)
+            XCTAssertEqual(saveCount, 0)
+        }
+    }
+
+    func testTestAndSaveWrongPasswordIsAnAuthenticationFailureNotAGenericOne() async throws {
+        let sessions = AppSessionProvider()
+        await sessions.setAccepted("correct-horse")
+        let model = model(sessions: sessions)
+        fillManual(model, password: "hunter2")
+        await model.testAndSave()
+        XCTAssertEqual(model.userFacingError, AppModel.FailureCategory.authenticationRejected.message)
+        XCTAssertNil(model.persistedAccount)
+    }
+
+    func testTestAndSaveStorageFailureAfterVerificationIsNotReportedAsAConnectionProblem() async throws {
+        let persistence = AppPersistence()
+        await persistence.setError(AccountPersistenceError.credentialWriteFailed)
+        let model = model(persistence: persistence)
+        fillManual(model, password: "hunter2")
+        await model.testAndSave()
+        XCTAssertEqual(model.operationState, .error)
+        XCTAssertEqual(model.userFacingError, AppModel.FailureCategory.accountStorage.message)
+        XCTAssertNil(model.persistedAccount)
+    }
+
+    func testUnclassifiedFailuresKeepTheGenericRedactedFallback() async throws {
+        let sessions = AppSessionProvider()
+        await sessions.setError(NSError(domain: "secret-sasl-payload", code: 7))
+        let saving = model(sessions: sessions)
+        fillManual(saving, password: "hunter2")
+        await saving.testAndSave()
+        XCTAssertEqual(saving.userFacingError, Self.testAndSaveFallback)
+
+        let service = AppService()
+        await service.setError(NSError(domain: "secret-sasl-payload", code: 7))
+        let refreshing = model(settings: AppSettingsStore(try account()), service: service)
+        await refreshing.load(); await refreshing.refresh()
+        XCTAssertEqual(refreshing.userFacingError, Self.refreshFallback)
+    }
+
+    func testRefreshReportsEachFailureCategoryDistinctlyRedactedAndNeverClaimsVerified() async throws {
+        var seen: [AppModel.FailureCategory: String] = [:]
+        for (error, category) in Self.categorizedFailures {
+            let service = AppService()
+            await service.enqueue(try snapshot())
+            let model = model(settings: AppSettingsStore(try account(manual: true)), service: service)
+            await model.load(); await model.refresh()
+            XCTAssertEqual(model.operationState, .verified)
+
+            await service.setError(error)
+            await model.refresh()
+            XCTAssertEqual(model.operationState, .error, "\(error)")
+            XCTAssertEqual(model.outOfOfficeStatus, .unknown, "\(error)")
+            XCTAssertNil(model.verifiedAt, "\(error)")
+            let message = try XCTUnwrap(model.userFacingError, "\(error)")
+            XCTAssertEqual(message, category.message, "\(error)")
+            XCTAssertNotEqual(message, Self.refreshFallback, "\(error)")
+            assertRedacted(message)
+            XCTAssertNotNil(model.persistedAccount, "A failed refresh never drops the account")
+            seen[category] = message
+        }
+        XCTAssertEqual(Set(seen.values).count, seen.count, "Distinct categories must show distinct messages")
+    }
+
     func testMarkStaleDuringInFlightSaveDoesNotDropPersistenceOrHangState() async throws {
         let persistence = AppPersistence(), gate = Gate()
         await persistence.setGate(gate)
@@ -419,6 +573,12 @@ final class AppModelTests: XCTestCase {
     }
 }
 
+extension AppDiscovery {
+    func setError(_ value: Error?) { error = value }
+}
+extension AppPersistence {
+    func setError(_ value: Error?) { error = value }
+}
 extension AppSessionProvider {
     func setError(_ value: Error?) { error = value }
     func setAccepted(_ value: String?) { accepted = value }

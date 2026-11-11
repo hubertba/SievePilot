@@ -147,14 +147,16 @@ final class ManageSieveLoopbackInteropTests: XCTestCase {
 
     /// The production session factory with the real client session; only DNS discovery and the trust
     /// anchor are replaced so the loopback fixture certificate can be validated.
-    private func factory(port: Int, group: EventLoopGroup, storedPassword: String) -> ManageSieveSessionFactory {
-        let identifiers = referenceIdentifiers
+    private func factory(port: Int, group: EventLoopGroup, storedPassword: String,
+                         identifiers: [ManageSieveReferenceIdentifier]? = nil,
+                         trustEvaluator: any TLSChainTrustEvaluating = FixtureTLSChainTrustEvaluator()) -> ManageSieveSessionFactory {
+        let identifiers = identifiers ?? referenceIdentifiers
         return ManageSieveSessionFactory(
             credentialStore: LoopbackCredentialStore(password: Data(storedPassword.utf8)),
             discover: { _ in SieveServiceEndpoint(host: "127.0.0.1", port: port, referenceIdentifiers: identifiers) },
             makeClient: { endpoint in
                 RealManageSieveClientSession(transport: NIOManageSieveTransport(
-                    endpoint: endpoint, eventLoopGroup: group, trustEvaluator: FixtureTLSChainTrustEvaluator()))
+                    endpoint: endpoint, eventLoopGroup: group, trustEvaluator: trustEvaluator))
             })
     }
 
@@ -204,6 +206,42 @@ final class ManageSieveLoopbackInteropTests: XCTestCase {
             XCTAssertEqual(result.scripts.first(where: \.isActive)?.name, "main")
             XCTAssertEqual(server.commands, ["STARTTLS", "AUTHENTICATE", "CAPABILITY", "LISTSCRIPTS", "LOGOUT"])
 
+            try await listener.close().get()
+            await shutdown(group)
+        }
+    }
+
+    func testRefusedAuthenticateIsAnAuthenticationRejectionThroughTheRealComposition() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let (listener, server) = try startServer(group: group, fragmented: false)
+        let factory = factory(port: listener.localAddress!.port!, group: group, storedPassword: "not-the-password")
+        do {
+            _ = try await factory.withAuthenticatedSession(account: account()) { _ in 1 }
+            XCTFail("A refused AUTHENTICATE must not open a session")
+        } catch {
+            XCTAssertEqual(error as? ManageSieveSessionFactoryError, .authenticationRejected)
+            XCTAssertFalse(String(reflecting: error).contains("Authentication failed"), "Server text must not be carried")
+        }
+        XCTAssertEqual(server.commands, ["STARTTLS", "AUTHENTICATE"])
+        try await listener.close().get()
+        await shutdown(group)
+    }
+
+    func testTrustAndIdentityFailuresStayDistinctAndPrecedeAuthenticationThroughTheRealComposition() async throws {
+        let cases: [(trust: any TLSChainTrustEvaluating, identifiers: [ManageSieveReferenceIdentifier], expected: ManageSieveClientError)] = [
+            (FixtureTLSChainTrustEvaluator(trusted: false), referenceIdentifiers, .tlsTrustFailed),
+            (FixtureTLSChainTrustEvaluator(), [.srv(service: "sieve", domain: "other.example.org"), .dns("other.example.org")], .tlsIdentityFailed),
+        ]
+        for (trust, identifiers, expected) in cases {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let (listener, server) = try startServer(group: group, fragmented: false)
+            let factory = factory(port: listener.localAddress!.port!, group: group, storedPassword: password,
+                                  identifiers: identifiers, trustEvaluator: trust)
+            do {
+                _ = try await factory.withAuthenticatedSession(account: account()) { _ in 1 }
+                XCTFail("Expected \(expected)")
+            } catch { XCTAssertEqual(error as? ManageSieveClientError, expected) }
+            XCTAssertEqual(server.commands, ["STARTTLS"], "Credentials must never be sent after a TLS failure")
             try await listener.close().get()
             await shutdown(group)
         }

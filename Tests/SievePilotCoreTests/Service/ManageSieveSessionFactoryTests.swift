@@ -183,15 +183,58 @@ final class ManageSieveSessionFactoryTests: XCTestCase {
         } catch { XCTAssertEqual(error as? ManageSieveSessionFactoryError, .invalidCredentialEncoding) }
     }
 
-    func testConnectionAndAuthenticationFailuresRemainClassifiedAndClose() async throws {
+    func testConnectionFailuresRemainClassifiedAndClose() async throws {
         let caps = try capabilities(sasl: "PLAIN")
-        for (connectError, authError) in [(ManageSieveClientError.tlsIdentityFailed as Error?, nil), (nil, ManageSieveClientError.serverNo as Error?)] {
-            let client = FactoryClient(caps); client.connectError = connectError; client.plainError = authError
+        // A NO before authentication (greeting or STARTTLS) is not a credential rejection.
+        for connectError in [ManageSieveClientError.tlsIdentityFailed, .tlsTrustFailed, .transport, .serverNo] {
+            let client = FactoryClient(caps); client.connectError = connectError
             let factory = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data("password".utf8)), discover: { _ in fatalError() }, makeClient: { _ in client })
             do { _ = try await factory.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in 1 }; XCTFail() }
-            catch { XCTAssertEqual(error as? ManageSieveClientError, connectError == nil ? .serverNo : .tlsIdentityFailed) }
+            catch { XCTAssertEqual(error as? ManageSieveClientError, connectError) }
+            XCTAssertEqual(client.authentications, [])
             XCTAssertEqual(client.closeCount, 1)
             XCTAssertEqual(client.logoutCount, 0)
         }
+    }
+
+    func testAuthenticationNoIsWrappedDistinctFromScriptNo() async throws {
+        for sasl in ["PLAIN", "LOGIN"] {
+            let client = FactoryClient(try capabilities(sasl: sasl))
+            client.plainError = ManageSieveClientError.serverNo; client.loginError = ManageSieveClientError.serverNo
+            let factory = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data("password".utf8)), discover: { _ in fatalError() }, makeClient: { _ in client })
+            do { _ = try await factory.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in 1 }; XCTFail(sasl) }
+            catch {
+                XCTAssertEqual(error as? ManageSieveSessionFactoryError, .authenticationRejected, sasl)
+                XCTAssertFalse(String(reflecting: error).contains("password"), sasl)
+            }
+            XCTAssertEqual(client.authentications.count, 1, sasl)
+            XCTAssertEqual(client.closeCount, 1, sasl)
+            XCTAssertEqual(client.logoutCount, 0, sasl)
+        }
+
+        // Other authentication-phase failures keep their own classification.
+        for authError in [ManageSieveClientError.serverBye, .transport, .timeout, .parse] {
+            let client = FactoryClient(try capabilities(sasl: "PLAIN")); client.plainError = authError
+            let factory = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data("password".utf8)), discover: { _ in fatalError() }, makeClient: { _ in client })
+            do { _ = try await factory.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in 1 }; XCTFail() }
+            catch { XCTAssertEqual(error as? ManageSieveClientError, authError) }
+            XCTAssertEqual(client.closeCount, 1)
+        }
+
+        // AUTHENTICATE succeeded but the capability refresh was refused: the client is closed and holds no
+        // capabilities, so this stays a protocol failure rather than a credential rejection.
+        let refreshRefused = FactoryClient(try capabilities(sasl: "PLAIN"))
+        refreshRefused.plainError = ManageSieveClientError.serverNo; refreshRefused.postAuthenticationCapabilities = nil
+        let factory = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data("password".utf8)), discover: { _ in fatalError() }, makeClient: { _ in refreshRefused })
+        do { _ = try await factory.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in 1 }; XCTFail() }
+        catch { XCTAssertEqual(error as? ManageSieveClientError, .serverNo) }
+        XCTAssertEqual(refreshRefused.closeCount, 1)
+
+        // A script command's NO inside the session is never rewritten as an authentication failure.
+        let scripted = FactoryClient(try capabilities(sasl: "PLAIN"))
+        let scriptedFactory = ManageSieveSessionFactory(credentialStore: FactoryCredentialStore(Data("password".utf8)), discover: { _ in fatalError() }, makeClient: { _ in scripted })
+        do { _ = try await scriptedFactory.withAuthenticatedSession(account: account(.manual(host: "mail.example.org", port: 4190))) { _ in throw ManageSieveClientError.serverNo } as Int; XCTFail() }
+        catch { XCTAssertEqual(error as? ManageSieveClientError, .serverNo) }
+        XCTAssertEqual(scripted.logoutCount, 1)
     }
 }

@@ -27,6 +27,9 @@ public enum ManageSieveClientError: Error, Equatable, Sendable {
     case tlsIdentityFailed
     case timeout
     case serverNo
+    /// A script command answered `NO` with a `QUOTA` response code (RFC 5804 §1.3). Like `serverNo`, the
+    /// session stays usable. Only the code's category is kept; the server's text is discarded.
+    case quotaExceeded
     case serverBye
 }
 
@@ -386,19 +389,30 @@ public actor ManageSieveClient {
                 guard response.dataLines.isEmpty || response.status.status == .ok else {
                     throw ManageSieveClientError.parse
                 }
+                if response.status.status == .no, Self.isQuotaResponseCode(response.status.responseCode) {
+                    throw ManageSieveClientError.quotaExceeded
+                }
                 try self.requireOK(response)
                 return try interpret(response)
             }
             try ensureOpen()
             admittedOperation = nil
             return value
-        } catch let error as ManageSieveClientError where error == .serverNo && state == .authenticated {
+        } catch let error as ManageSieveClientError
+                    where (error == .serverNo || error == .quotaExceeded) && state == .authenticated {
             admittedOperation = nil
             throw error
         } catch {
             await closeAfterFailure()
             throw sanitized(error)
         }
+    }
+
+    /// `QUOTA`, `QUOTA/MAXSCRIPTS`, and `QUOTA/MAXSIZE` (RFC 5804 §1.3), matched case-insensitively.
+    private static func isQuotaResponseCode(_ code: ManageSieveToken?) -> Bool {
+        guard case let .list(tokens)? = code, case let .atom(name)? = tokens.first else { return false }
+        let folded = name.uppercased()
+        return folded == "QUOTA" || folded.hasPrefix("QUOTA/")
     }
 
     public func close() async {
