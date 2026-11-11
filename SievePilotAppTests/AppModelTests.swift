@@ -3,7 +3,7 @@ import XCTest
 import SievePilotCore
 @testable import SievePilot
 
-private actor AppSettingsStore: AccountConfigurationStoring {
+actor AppSettingsStore: AccountConfigurationStoring {
     var value: AccountConfiguration?
     init(_ value: AccountConfiguration? = nil) { self.value = value }
     func load() async throws -> AccountConfiguration? { value }
@@ -11,7 +11,7 @@ private actor AppSettingsStore: AccountConfigurationStoring {
     func delete() async throws { value = nil }
 }
 
-private actor Gate {
+actor Gate {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
     // Intentionally ignores task cancellation, like an uncooperative dependency.
@@ -26,7 +26,7 @@ private actor Gate {
     }
 }
 
-private actor AppPersistence: AccountPersistenceCoordinating {
+actor AppPersistence: AccountPersistenceCoordinating {
     var saves: [(AccountConfiguration, Data)] = []
     var deletes: [AccountID] = []
     var error: Error?
@@ -49,7 +49,7 @@ private actor AppPersistence: AccountPersistenceCoordinating {
     func setGate(_ value: Gate?) { gate = value }
 }
 
-private actor AppDiscovery: SieveServiceDiscovering {
+actor AppDiscovery: SieveServiceDiscovering {
     var endpoints: [SieveServiceEndpoint] = []
     var emails: [String] = []
     var error: Error?
@@ -62,7 +62,7 @@ private actor AppDiscovery: SieveServiceDiscovering {
 
 /// Stands in for the production factory's candidate-credential path: it can only see the
 /// password handed to it, never a stored credential, and rejects anything but `accepted`.
-private actor AppSessionProvider: ManageSieveCandidateSessionProviding {
+actor AppSessionProvider: ManageSieveCandidateSessionProviding {
     var calls: [(AccountID, String)] = []
     var accepted: String?
     var error: Error?
@@ -81,11 +81,11 @@ private actor AppSessionProvider: ManageSieveCandidateSessionProviding {
     func candidates() -> [String] { calls.map(\.1) }
 }
 
-private struct AppSession: AuthenticatedManageSieveSession {
+struct AppSession: AuthenticatedManageSieveSession {
     let capabilities: ManageSieveCapabilities
-    init() {
+    init(sieve: String = "vacation date relational") {
         let lines = ["IMPLEMENTATION", "VERSION", "SASL", "SIEVE"].map {
-            ManageSieveWireLine(tokens: [.string(Data($0.utf8)), .string(Data(($0 == "SIEVE" ? "vacation date relational" : "test").utf8))])
+            ManageSieveWireLine(tokens: [.string(Data($0.utf8)), .string(Data(($0 == "SIEVE" ? sieve : "test").utf8))])
         }
         capabilities = try! ManageSieveCapabilities(response: ManageSieveCommandResponse(lines: lines + [.init(tokens: [.atom("OK")])]), origin: .postTLSCapability)
     }
@@ -97,25 +97,41 @@ private struct AppSession: AuthenticatedManageSieveSession {
     func deleteScript(name: String, timeout: Duration?) async throws {}
 }
 
-private actor AppService: SieveAccountServicing {
+actor AppService: SieveAccountServicing {
     var snapshots: [VerifiedAccountSnapshot] = []
     var error: Error?
     var delay: UInt64 = 0
     var gate: Gate?
+    var refreshCount = 0
+    var applyOutcomes: [Result<AccountMutationOutcome, Error>] = []
+    var applied: [OutOfOfficeConfiguration?] = []
+    var applyGate: Gate?
     func refresh(account: AccountConfiguration) async throws -> VerifiedAccountSnapshot {
+        refreshCount += 1
         if let error { throw error }
-        await gate?.wait()
+        guard !snapshots.isEmpty else { throw NSError(domain: "no-snapshot", code: 1) }
+        // Claimed at call time so concurrent calls get deterministic, ordered snapshots.
         let snapshot = snapshots.removeFirst()
+        await gate?.wait()
         let currentDelay = delay
         if currentDelay > 0 { try await Task.sleep(nanoseconds: currentDelay) }
         return snapshot
     }
     func enqueue(_ snapshot: VerifiedAccountSnapshot) { snapshots.append(snapshot) }
-    func applyOutOfOffice(account: AccountConfiguration, configuration: OutOfOfficeConfiguration?) async throws -> AccountMutationOutcome { .unknown }
+    func applyOutOfOffice(account: AccountConfiguration, configuration: OutOfOfficeConfiguration?) async throws -> AccountMutationOutcome {
+        applied.append(configuration)
+        await applyGate?.wait()
+        guard !applyOutcomes.isEmpty else { return .unknown }
+        return try applyOutcomes.removeFirst().get()
+    }
+    func enqueueOutcome(_ outcome: Result<AccountMutationOutcome, Error>) { applyOutcomes.append(outcome) }
+    func appliedConfigurations() -> [OutOfOfficeConfiguration?] { applied }
+    func refreshCalls() -> Int { refreshCount }
+    func setApplyGate(_ value: Gate?) { applyGate = value }
 }
 
 @MainActor
-private final class FakeLifecycle: AppLifecycleObserving {
+final class FakeLifecycle: AppLifecycleObserving {
     private(set) var handler: (@MainActor @Sendable (AppLifecycleEvent) -> Void)?
     func start(_ handler: @escaping @MainActor @Sendable (AppLifecycleEvent) -> Void) { self.handler = handler }
     func send(_ event: AppLifecycleEvent) { handler?(event) }
@@ -403,12 +419,12 @@ final class AppModelTests: XCTestCase {
     }
 }
 
-private extension AppSessionProvider {
+extension AppSessionProvider {
     func setError(_ value: Error?) { error = value }
     func setAccepted(_ value: String?) { accepted = value }
     func setNextGate(_ value: Gate?) { nextGate = value }
 }
-private extension AppService {
+extension AppService {
     func setError(_ value: Error?) { error = value }
     func setDelay(_ value: UInt64) { delay = value }
     func setGate(_ value: Gate?) { gate = value }

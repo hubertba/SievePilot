@@ -20,6 +20,7 @@ struct StatusBanner: View {
         case .loading: "Loading…"
         case .testing: "Testing secure connection…"
         case .refreshing: "Refreshing…"
+        case .applying: "Applying out-of-office change…"
         case .stale: "Refresh to verify server state"
         case .verified: "Server state verified"
         case .unknown: "Server state unknown"

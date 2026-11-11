@@ -23,7 +23,10 @@ validate_sources() {
   require_file SievePilotApp/SievePilotApp.swift
   require_file SievePilotApp/Assets.xcassets/Contents.json
   require_file SievePilotApp/Assets.xcassets/AppIcon.appiconset/Contents.json
+  require_file SievePilotApp/Views/OutOfOfficeView.swift
+  require_file SievePilotApp/Views/AccountSettingsView.swift
   require_file SievePilotAppTests/AppModelTests.swift
+  require_file SievePilotAppTests/OutOfOfficeFlowTests.swift
   require_text SievePilotApp/SievePilotApp.swift 'import SievePilotCore'
   require_text SievePilotApp/SievePilotApp.swift 'MenuBarExtra'
   require_text SievePilotApp/SievePilotApp.swift 'NSApplication.shared.terminate(nil)'

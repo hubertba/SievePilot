@@ -35,6 +35,15 @@ make_fixture "$baseline"
 expect_rejected missing-app-source \
   "python3 -c \"from pathlib import Path; p=Path('SievePilot.xcodeproj/project.pbxproj'); s=p.read_text(); p.write_text(s.replace('\\t\\t\\t\\t100000000000000000000001 /* AppModel.swift in Sources */,\\n', '', 1))\""
 
+expect_rejected missing-out-of-office-view-source \
+  "python3 -c \"from pathlib import Path; p=Path('SievePilot.xcodeproj/project.pbxproj'); s=p.read_text(); p.write_text(s.replace('\\t\\t\\t\\t10000000000000000000000A /* OutOfOfficeView.swift in Sources */,\\n', '', 1))\""
+
+expect_rejected missing-account-settings-view-source \
+  "python3 -c \"from pathlib import Path; p=Path('SievePilot.xcodeproj/project.pbxproj'); s=p.read_text(); p.write_text(s.replace('\\t\\t\\t\\t10000000000000000000000B /* AccountSettingsView.swift in Sources */,\\n', '', 1))\""
+
+expect_rejected missing-out-of-office-flow-test-source \
+  "python3 -c \"from pathlib import Path; p=Path('SievePilot.xcodeproj/project.pbxproj'); s=p.read_text(); p.write_text(s.replace('\\t\\t\\t\\t10000000000000000000000C /* OutOfOfficeFlowTests.swift in Sources */,\\n', '', 1))\""
+
 expect_rejected missing-core-framework-link \
   "python3 -c \"from pathlib import Path; p=Path('SievePilot.xcodeproj/project.pbxproj'); s=p.read_text(); p.write_text(s.replace('\\t\\t\\t\\t100000000000000000000005 /* SievePilotCore in Frameworks */,\\n', '', 1))\""
 

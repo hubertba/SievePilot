@@ -16,6 +16,9 @@
 		100000000000000000000007 /* AppLifecycleCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000008 /* AppLifecycleCoordinator.swift */; };
 		100000000000000000000008 /* SetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000009 /* SetupView.swift */; };
 		100000000000000000000009 /* StatusBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000A /* StatusBanner.swift */; };
+		10000000000000000000000A /* OutOfOfficeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000B /* OutOfOfficeView.swift */; };
+		10000000000000000000000B /* AccountSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000C /* AccountSettingsView.swift */; };
+		10000000000000000000000C /* OutOfOfficeFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000D /* OutOfOfficeFlowTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -39,6 +42,9 @@
 		200000000000000000000008 /* AppLifecycleCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLifecycleCoordinator.swift; sourceTree = "<group>"; };
 		200000000000000000000009 /* SetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupView.swift; sourceTree = "<group>"; };
 		20000000000000000000000A /* StatusBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBanner.swift; sourceTree = "<group>"; };
+		20000000000000000000000B /* OutOfOfficeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutOfOfficeView.swift; sourceTree = "<group>"; };
+		20000000000000000000000C /* AccountSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSettingsView.swift; sourceTree = "<group>"; };
+		20000000000000000000000D /* OutOfOfficeFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutOfOfficeFlowTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -86,6 +92,8 @@
 			isa = PBXGroup;
 			children = (
 				200000000000000000000009 /* SetupView.swift */,
+				20000000000000000000000B /* OutOfOfficeView.swift */,
+				20000000000000000000000C /* AccountSettingsView.swift */,
 				20000000000000000000000A /* StatusBanner.swift */,
 			);
 			path = Views;
@@ -95,6 +103,7 @@
 			isa = PBXGroup;
 			children = (
 				200000000000000000000006 /* AppModelTests.swift */,
+				20000000000000000000000D /* OutOfOfficeFlowTests.swift */,
 			);
 			path = SievePilotAppTests;
 			sourceTree = "<group>";
@@ -217,6 +226,8 @@
 				100000000000000000000006 /* AppDependencies.swift in Sources */,
 				100000000000000000000007 /* AppLifecycleCoordinator.swift in Sources */,
 				100000000000000000000008 /* SetupView.swift in Sources */,
+				10000000000000000000000A /* OutOfOfficeView.swift in Sources */,
+				10000000000000000000000B /* AccountSettingsView.swift in Sources */,
 				100000000000000000000009 /* StatusBanner.swift in Sources */,
 				100000000000000000000002 /* SievePilotApp.swift in Sources */,
 			);
@@ -227,6 +238,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				100000000000000000000004 /* AppModelTests.swift in Sources */,
+				10000000000000000000000C /* OutOfOfficeFlowTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

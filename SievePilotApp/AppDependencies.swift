@@ -22,6 +22,27 @@ protocol SieveAccountServicing: Sendable {
 
 extension SieveAccountService: SieveAccountServicing {}
 
+/// Remembers, per account, that the user has read the first-activation rule-order notice.
+protocol ActivationAcknowledgementStoring: AnyObject, Sendable {
+    func hasAcknowledged(_ accountID: AccountID) -> Bool
+    func acknowledge(_ accountID: AccountID)
+}
+
+final class UserDefaultsActivationAcknowledgementStore: ActivationAcknowledgementStoring, @unchecked Sendable {
+    private let defaults: UserDefaults
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    private func key(_ id: AccountID) -> String { "ruleOrderingAcknowledged.\(id.rawValue.uuidString)" }
+    func hasAcknowledged(_ accountID: AccountID) -> Bool { defaults.bool(forKey: key(accountID)) }
+    func acknowledge(_ accountID: AccountID) { defaults.set(true, forKey: key(accountID)) }
+}
+
+final class InMemoryActivationAcknowledgementStore: ActivationAcknowledgementStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var acknowledged: Set<AccountID> = []
+    func hasAcknowledged(_ accountID: AccountID) -> Bool { lock.lock(); defer { lock.unlock() }; return acknowledged.contains(accountID) }
+    func acknowledge(_ accountID: AccountID) { lock.lock(); acknowledged.insert(accountID); lock.unlock() }
+}
+
 struct AppDependencies {
     let settingsStore: any AccountConfigurationStoring
     let persistence: any AccountPersistenceCoordinating
@@ -29,6 +50,7 @@ struct AppDependencies {
     let sessionProvider: any ManageSieveCandidateSessionProviding
     let accountService: any SieveAccountServicing
     let lifecycle: any AppLifecycleObserving
+    let acknowledgements: any ActivationAcknowledgementStoring
 
     @MainActor
     static func production() -> AppDependencies {
@@ -42,6 +64,7 @@ struct AppDependencies {
         let service = SieveAccountService(sessionProvider: sessions, manifestStore: manifests)
         return AppDependencies(settingsStore: settings, persistence: persistence, discovery: discovery,
                                sessionProvider: sessions, accountService: service,
-                               lifecycle: AppLifecycleCoordinator())
+                               lifecycle: AppLifecycleCoordinator(),
+                               acknowledgements: UserDefaultsActivationAcknowledgementStore())
     }
 }

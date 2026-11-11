@@ -68,14 +68,15 @@ test_id, tests = target_named("SievePilotAppTests")
 
 required_app_sources = {
     "AppModel.swift", "AppDependencies.swift", "AppLifecycleCoordinator.swift",
-    "SetupView.swift", "StatusBanner.swift", "SievePilotApp.swift",
+    "SetupView.swift", "OutOfOfficeView.swift", "AccountSettingsView.swift",
+    "StatusBanner.swift", "SievePilotApp.swift",
 }
 require(required_app_sources.issubset(phase_items(app, "PBXSourcesBuildPhase")),
         "app target source membership is incomplete")
 require("Assets.xcassets" in phase_items(app, "PBXResourcesBuildPhase"),
         "app target does not contain Assets.xcassets")
-require("AppModelTests.swift" in phase_items(tests, "PBXSourcesBuildPhase"),
-        "test target does not contain AppModelTests.swift")
+require({"AppModelTests.swift", "OutOfOfficeFlowTests.swift"}.issubset(phase_items(tests, "PBXSourcesBuildPhase")),
+        "test target does not contain AppModelTests.swift and OutOfOfficeFlowTests.swift")
 framework_products = phase_reference_ids(app, "PBXFrameworksBuildPhase")
 package_products = set(app.get("packageProductDependencies", []))
 linked_core_products = {
