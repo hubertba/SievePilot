@@ -90,7 +90,7 @@ Every app operation uses a fresh connection. Logout/close occurs in `defer`; the
 `SieveAccountService` owns refresh and mutation workflows:
 
 - refresh lists scripts, fetches the active script as `Data`, evaluates managed state, and returns a timestamped verified snapshot;
-- mutation refreshes immediately before editing, records active name/bytes/digest, patches only owned ranges, and validates with `CHECKSCRIPT` when advertised;
+- mutation refreshes immediately before editing, records active name/bytes/digest, patches only owned ranges, and validates with `CHECKSCRIPT` when the server advertises `VERSION` (RFC 5804 defines no separate `CHECKSCRIPT` capability);
 - it creates a cryptographically random owned version name, uploads it, repeats baseline checks, activates it, and reads it back byte-for-byte;
 - detected changes stop before activation and return conflict;
 - interrupted activation returns unknown until the next refresh resolves it;

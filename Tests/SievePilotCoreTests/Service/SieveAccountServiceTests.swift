@@ -79,14 +79,13 @@ final class SieveAccountServiceTests: XCTestCase {
     private let accountID = AccountID(rawValue: UUID(uuidString: "8CBCBCC8-2E3C-49BE-9464-A238AD398005")!)
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-    private func capabilities(checkScript: Bool = false, extensions: String = "vacation date relational") throws -> ManageSieveCapabilities {
-        var lines = [
+    private func capabilities(extensions: String = "vacation date relational") throws -> ManageSieveCapabilities {
+        let lines = [
             ManageSieveWireLine(tokens: [.string(Data("IMPLEMENTATION".utf8)), .string(Data("test".utf8))]),
-            ManageSieveWireLine(tokens: [.string(Data("VERSION".utf8)), .string(Data("1".utf8))]),
+            ManageSieveWireLine(tokens: [.string(Data("VERSION".utf8)), .string(Data("1.0".utf8))]),
             ManageSieveWireLine(tokens: [.string(Data("SASL".utf8)), .string(Data("PLAIN".utf8))]),
             ManageSieveWireLine(tokens: [.string(Data("SIEVE".utf8)), .string(Data(extensions.utf8))])
         ]
-        if checkScript { lines.append(ManageSieveWireLine(tokens: [.string(Data("CHECKSCRIPT".utf8))])) }
         return try ManageSieveCapabilities(response: ManageSieveCommandResponse(lines: lines + [.init(tokens: [.atom("OK")])]), origin: .postTLSCapability)
     }
 
@@ -217,7 +216,7 @@ final class SieveAccountServiceTests: XCTestCase {
     func testMutationUsesRawBaselineCheckScriptCollisionRetryManifestPhasesAndReadBack() async throws {
         let baseline = Data([0xff, 0x00, 0x0a])
         let collision = "sievepilot-\(accountID.sieveToken)-01020304"
-        let session = ServiceSession(capabilities: try capabilities(checkScript: true), scripts: ["base": baseline, collision: Data("owned".utf8)], active: "base")
+        let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline, collision: Data("owned".utf8)], active: "base")
         let manifests = MemoryManifestStore()
         let draws = DrawSource([Data([1,2,3,4]), Data([5,6,7,8])])
         let outcome = try await service(session, manifests: manifests, random: { draws.next() })
@@ -234,14 +233,25 @@ final class SieveAccountServiceTests: XCTestCase {
         XCTAssertEqual(records.first?.predecessorSHA256, SieveAccountService.sha256(baseline))
     }
 
-    func testMutationConflictStopsBeforeActivationAndCheckScriptIsOptional() async throws {
+    // RFC 5804 defines no CHECKSCRIPT capability: any server advertising VERSION supports the command.
+    func testCheckScriptIsSentBeforeUploadWheneverTheServerAdvertisesVersion() async throws {
+        let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": Data("keep;\n".utf8)], active: "base")
+        let outcome = try await service(session).applyOutOfOffice(account: account(), configuration: configuration())
+        guard case .verified = outcome else { return XCTFail("Expected verified") }
+        let events = await session.events
+        let check = try XCTUnwrap(events.firstIndex(of: "check"), "CHECKSCRIPT must be sent to a VERSION-advertising server")
+        let put = try XCTUnwrap(events.firstIndex { $0.hasPrefix("put:") })
+        XCTAssertLessThan(check, put, "Validation must precede the upload")
+        XCTAssertEqual(events.filter { $0 == "check" }.count, 1)
+    }
+
+    func testMutationConflictStopsBeforeActivation() async throws {
         let baseline = Data("keep;\n".utf8)
         let session = ServiceSession(capabilities: try capabilities(), scripts: ["base": baseline], active: "base")
         await session.setConflictOnSecondList(name: "base", script: Data("changed".utf8))
         let outcome = try await service(session).applyOutOfOffice(account: account(), configuration: configuration())
         XCTAssertEqual(outcome, .conflict)
         let events = await session.events
-        XCTAssertFalse(events.contains("check"))
         XCTAssertFalse(events.contains { $0.hasPrefix("active:") })
     }
 

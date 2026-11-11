@@ -76,7 +76,8 @@ for names starting with `sievepilot-` and restore from your backup if needed.
 ## Expected server capabilities
 
 After authentication the server should advertise a post-TLS capability list with `IMPLEMENTATION`, `VERSION`, `SASL`
-(`PLAIN` or `LOGIN`), and `SIEVE` including `vacation`, `date`, and `relational`. `CHECKSCRIPT` is used when advertised.
+(`PLAIN` or `LOGIN`), and `SIEVE` including `vacation`, `date`, and `relational`. RFC 5804 defines no
+`CHECKSCRIPT` capability; the command is used whenever the server advertises `VERSION`.
 The server must support `STARTTLS` on the ManageSieve port and, as RFC 5804 §2.2 requires, re-issue its capabilities
 unsolicited once TLS is established.
 

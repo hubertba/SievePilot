@@ -92,7 +92,10 @@ public actor SieveAccountService {
                                                      predecessorSHA256: baselineName == nil ? nil : baselineDigest)
             let mutation: SieveScriptMutation = configuration.map(SieveScriptMutation.enable) ?? .disable
             let candidate = try SieveScriptPatcher.apply(mutation, to: baseline, metadata: metadata, accountID: account.accountID)
-            if capabilities.containsCapability("CHECKSCRIPT") {
+            // RFC 5804 defines no CHECKSCRIPT capability; a server that advertises VERSION implements the
+            // command (§1.7). An authoritative capability list always carries VERSION, so this runs for
+            // every server the client accepts.
+            if capabilities.containsCapability("VERSION") {
                 _ = try await session.checkScript(candidate, timeout: nil)
             }
             let allNames = Set(initialEntries.map(\.name))
