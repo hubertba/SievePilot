@@ -8,7 +8,7 @@ The first planned feature is an out-of-office rule with reliable server-side exp
 
 The initial release is feature complete: account setup, a secure ManageSieve client, safe versioned script updates, and an operational out-of-office menu are implemented. See [the design](docs/superpowers/specs/2026-04-24-sievepilot-design.md), [the core-engine plan](docs/superpowers/plans/2026-11-08-sievepilot-core-engine.md), and [the app-target design](docs/superpowers/specs/2026-11-09-macos-app-target-design.md).
 
-Automated tests use deterministic fake transports and fake services. Live interoperability with a real ManageSieve server requires server access that you supply; it is not exercised by the automated test suite and is not claimed here.
+Automated tests use deterministic fake transports and fake services. Live interoperability with a real ManageSieve server requires server access that you supply; it is not exercised by the automated test suite and is not claimed here. An opt-in interoperability harness that skips by default is described in [docs/live-interoperability.md](docs/live-interoperability.md).
 
 ## Using SievePilot
 
