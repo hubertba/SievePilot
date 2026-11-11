@@ -6,5 +6,7 @@ public enum NIOTransportError: Error, Equatable, Sendable {
     case inboundOverflow
     case writeFailed
     case closed
-    case tlsUnsupported
+    case tlsTrustFailed
+    case tlsIdentityFailed
+    case tlsHandshakeFailed
 }

@@ -3,7 +3,7 @@ import Testing
 @testable import SievePilotCore
 
 @Suite struct ManageSieveCommandTests {
-    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: ["mail.example.org"])
+    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: [.dns("mail.example.org")])
     private let secure = "\"IMPLEMENTATION\" \"test\"\r\n\"VERSION\" \"2\"\r\n\"SASL\" \"PLAIN\"\r\n\"SIEVE\" \"fileinto\"\r\nOK\r\n"
 
     private func client(_ suffix: [FakeManageSieveTransport.Step], authenticated: Bool = true, logger: any ManageSieveLogger = FakeManageSieveLogger()) async throws -> (FakeManageSieveTransport, ManageSieveClient) {
@@ -117,7 +117,7 @@ import Testing
         await expect(.serverNo) { _ = try await client.putScript(name: "name", script: bytes) }
         let reported = logger.events.map { String(describing: $0) }.joined()
         #expect(!reported.contains("body warning"))
-        #expect(await transport.readCount == 7) // handshake (3), auth (2), then one read per script command
+        #expect(await transport.readCount == 10) // handshake (6, including four one-byte STARTTLS reads), auth (2), script commands (2)
         #expect(await transport.assertComplete())
     }
 

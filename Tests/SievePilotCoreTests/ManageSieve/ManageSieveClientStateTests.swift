@@ -3,9 +3,27 @@ import Testing
 @testable import SievePilotCore
 
 @Suite struct ManageSieveClientStateTests {
-    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: ["mail.example.org"])
+    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: [.dns("mail.example.org")])
     private let postTLS = "\"IMPLEMENTATION\" \"secure\"\r\n\"VERSION\" \"2\"\r\n\"SASL\" \"PLAIN\"\r\n\"SIEVE\" \"fileinto\"\r\nOK\r\n"
     private let greeting = "\"STARTTLS\"\r\n\"SASL\" \"UNTRUSTED\"\r\n\"SIEVE\" \"unsafe\"\r\nOK\r\n"
+
+    @Test func startTLSTerminalResponseUsesOnlyOneByteTransportReads() async throws {
+        let transport = FakeManageSieveTransport([
+            .connect, .read(Data(greeting.utf8)),
+            .write(Data("STARTTLS\r\n".utf8)), .read(Data("OK\r\n".utf8)),
+            .upgrade(identity), .write(Data("CAPABILITY\r\n".utf8)), .read(Data(postTLS.utf8))
+        ])
+        _ = try await makeClient(transport).connectAndStartTLS(identity: identity)
+        #expect(await transport.readLimits == [4096, 1, 1, 1, 1, 4096])
+        #expect(await transport.assertComplete())
+    }
+
+    @Test func fakeSplitsScriptedReadsAtMaximumBytes() async throws {
+        let transport = FakeManageSieveTransport([.read(Data("OK\r\nTLS".utf8))])
+        #expect(try await transport.read(maxBytes: 4) == Data("OK\r\n".utf8))
+        #expect(try await transport.read(maxBytes: 3) == Data("TLS".utf8))
+        #expect(await transport.assertComplete())
+    }
 
     @Test func startTLSHandshakeDiscardsUntrustedGreetingAndUsesEncryptedCapabilities() async throws {
         let transport = FakeManageSieveTransport([
@@ -78,6 +96,21 @@ import Testing
         #expect(await transport.closeCount == 1)
         #expect(await transport.upgradeCount == 0)
         #expect(await transport.writes == [Data("STARTTLS\r\n".utf8)])
+        #expect(await transport.assertComplete())
+    }
+
+    @Test(arguments: [NIOTransportError.tlsTrustFailed, .tlsIdentityFailed])
+    func tlsErrorsRemainDistinctAndSanitized(error: NIOTransportError) async {
+        let transport = FakeManageSieveTransport([
+            .connect, .read(Data(greeting.utf8)), .write(Data("STARTTLS\r\n".utf8)),
+            .read(Data("OK\r\n".utf8)), .tlsFailure(error)
+        ])
+        let client = makeClient(transport)
+        await expectError(error == .tlsTrustFailed ? .tlsTrustFailed : .tlsIdentityFailed) {
+            try await client.connectAndStartTLS(identity: identity)
+        }
+        #expect(await transport.upgradeCount == 1)
+        #expect(await transport.closeCount == 1)
         #expect(await transport.assertComplete())
     }
 

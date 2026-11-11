@@ -3,7 +3,7 @@ import Testing
 @testable import SievePilotCore
 
 @Suite struct ManageSieveAuthenticationTests {
-    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: ["mail.example.org"])
+    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: [.dns("mail.example.org")])
     private let greeting = "\"STARTTLS\"\r\nOK\r\n"
     private let secure = "\"IMPLEMENTATION\" \"before\"\r\n\"VERSION\" \"2\"\r\n\"SASL\" \"PLAIN LOGIN\"\r\n\"SIEVE\" \"fileinto\"\r\nOK\r\n"
     private let refreshed = "\"IMPLEMENTATION\" \"after\"\r\n\"VERSION\" \"2\"\r\n\"SASL\" \"PLAIN LOGIN\"\r\n\"SIEVE\" \"fileinto\"\r\nOK\r\n"

@@ -13,6 +13,7 @@ actor FakeManageSieveTransport: ManageSieveTransport {
         case write(Data)
         case upgrade(ManageSieveTLSIdentityRequest)
         case failure
+        case tlsFailure(NIOTransportError)
     }
 
     enum Suspension: Sendable { case read, write, upgrade }
@@ -22,6 +23,7 @@ actor FakeManageSieveTransport: ManageSieveTransport {
     private var connectContinuation: CheckedContinuation<Void, Never>?
     private(set) var writes: [Data] = []
     private(set) var readCount = 0
+    private(set) var readLimits: [Int] = []
     private(set) var closeCount = 0
     private(set) var upgradeCount = 0
     private(set) var slowReadStarted = false
@@ -50,10 +52,11 @@ actor FakeManageSieveTransport: ManageSieveTransport {
 
     func read(maxBytes: Int) async throws -> Data {
         readCount += 1
+        readLimits.append(maxBytes)
         switch take() {
         case let .read(data):
-            if data.count > maxBytes { violations.append("oversized read") }
-            return data
+            if data.count > maxBytes { steps.insert(.read(Data(data.dropFirst(maxBytes))), at: 0) }
+            return Data(data.prefix(maxBytes))
         case .suspendRead:
             return try await suspend(.read)
         case .slowRead:
@@ -80,6 +83,7 @@ actor FakeManageSieveTransport: ManageSieveTransport {
         case let .upgrade(expected) where expected == identity: break
         case let .suspendUpgrade(expected) where expected == identity: _ = try await suspend(.upgrade)
         case .failure: throw FakeError.injected
+        case .tlsFailure(let error): throw error
         default: throw FakeError.unexpectedStep
         }
     }

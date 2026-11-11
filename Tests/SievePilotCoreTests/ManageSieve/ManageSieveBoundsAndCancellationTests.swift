@@ -3,7 +3,7 @@ import Testing
 @testable import SievePilotCore
 
 @Suite struct ManageSieveBoundsAndCancellationTests {
-    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: ["mail.example.org"])
+    private let identity = ManageSieveTLSIdentityRequest(referenceIdentifiers: [.dns("mail.example.org")])
     private let secure = Data("\"IMPLEMENTATION\" \"fake\"\r\n\"VERSION\" \"2\"\r\n\"SIEVE\" \"fileinto\"\r\n\"SASL\" \"PLAIN LOGIN\"\r\nOK\r\n".utf8)
     private let user = "credential-user-sentinel-491"
     private let password = "credential-password-sentinel-682"

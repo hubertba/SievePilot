@@ -23,6 +23,8 @@ public enum ManageSieveClientError: Error, Equatable, Sendable {
     case parse
     case transport
     case tls
+    case tlsTrustFailed
+    case tlsIdentityFailed
     case timeout
     case serverNo
     case serverBye
@@ -59,7 +61,7 @@ public actor ManageSieveClient {
         try checkAdmission()
         guard state == .disconnected else { throw ManageSieveClientError.invalidState }
         guard !identity.referenceIdentifiers.isEmpty,
-              identity.referenceIdentifiers.allSatisfy({ !$0.isEmpty }) else {
+              identity.referenceIdentifiers.allSatisfy(\.isWellFormed) else {
             throw ManageSieveClientError.invalidIdentity
         }
         admittedOperation = ManageSieveOperationAdmission()
@@ -419,11 +421,16 @@ public actor ManageSieveClient {
         }
         state = .startTLS
         try await send("STARTTLS\r\n")
-        let response = try await readResponse()
+        // Preserve any coalesced TLS-record suffix in the transport, starting at a record boundary.
+        let response = try await readResponse(maxBytes: 1)
         try requireOK(response)
         guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
         do { try await transport.upgradeToTLS(identity: identity) } catch {
-            throw ManageSieveClientError.tls
+            switch error as? NIOTransportError {
+            case .tlsTrustFailed: throw ManageSieveClientError.tlsTrustFailed
+            case .tlsIdentityFailed: throw ManageSieveClientError.tlsIdentityFailed
+            default: throw ManageSieveClientError.tls
+            }
         }
         // No greeting-derived fields survive the upgrade or become authoritative.
         capabilities = nil
@@ -458,13 +465,13 @@ public actor ManageSieveClient {
         try ensureOpen()
     }
 
-    private func readResponse() async throws -> ManageSieveCommandResponse {
+    private func readResponse(maxBytes: Int = 4096) async throws -> ManageSieveCommandResponse {
         var parser = ManageSieveResponseParser(limits: limits)
         var lines: [ManageSieveWireLine] = []
         while true {
             try ensureOpen()
             let bytes: Data
-            do { bytes = try await transport.read(maxBytes: 4096) } catch {
+            do { bytes = try await transport.read(maxBytes: maxBytes) } catch {
                 throw ManageSieveClientError.transport
             }
             try ensureOpen()

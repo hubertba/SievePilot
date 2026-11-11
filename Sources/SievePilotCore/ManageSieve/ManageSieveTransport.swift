@@ -9,10 +9,16 @@ public protocol ManageSieveTransport: AnyObject, Sendable {
     func close() async
 }
 
-public struct ManageSieveTLSIdentityRequest: Equatable, Sendable {
-    public let referenceIdentifiers: [String]
+public enum ManageSieveReferenceIdentifier: Equatable, Sendable {
+    case dns(String)
+    // Service label without the leading underscore, e.g. "sieve".
+    case srv(service: String, domain: String)
+}
 
-    public init(referenceIdentifiers: [String]) {
+public struct ManageSieveTLSIdentityRequest: Equatable, Sendable {
+    public let referenceIdentifiers: [ManageSieveReferenceIdentifier]
+
+    public init(referenceIdentifiers: [ManageSieveReferenceIdentifier]) {
         self.referenceIdentifiers = referenceIdentifiers
     }
 }

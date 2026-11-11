@@ -1,6 +1,9 @@
 import Foundation
 import NIOCore
 import NIOPosix
+import NIOSSL
+import NIOTLS
+import X509
 
 public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sendable {
     public struct Endpoint: Equatable, Sendable {
@@ -20,6 +23,13 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
         case closed
     }
 
+    private let trustEvaluator: any TLSChainTrustEvaluating
+    private var inboundHandler: InboundHandler?
+    private var tlsStarted = false
+    private var tlsReady = false
+    private var tlsVerified = false
+    private var handshakeWaiter: CheckedContinuation<Void, Error>?
+    private var verificationPromise: EventLoopPromise<NIOSSLVerificationResult>?
     private let endpoint: Endpoint
     private let group: any EventLoopGroup
     private let ownsGroup: Bool
@@ -43,7 +53,8 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     }
 
     // The hook exposes admission to deterministic loopback race tests; production never supplies it.
-    internal init(endpoint: Endpoint, eventLoopGroup: (any EventLoopGroup)?, submissionHook: (() -> Void)?, closeHook: (() -> Void)? = nil, shutdownHook: (() -> Void)? = nil) {
+    internal init(endpoint: Endpoint, eventLoopGroup: (any EventLoopGroup)?, trustEvaluator: any TLSChainTrustEvaluating = SecurityTLSChainTrustEvaluator(), submissionHook: (() -> Void)? = nil, closeHook: (() -> Void)? = nil, shutdownHook: (() -> Void)? = nil) {
+        self.trustEvaluator = trustEvaluator
         self.endpoint = endpoint
         self.ownsGroup = eventLoopGroup == nil
         self.group = eventLoopGroup ?? MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -68,7 +79,17 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
             submissionHook?()
             defer { finishSubmission() }
             let bootstrap = ClientBootstrap(group: group)
-                .channelInitializer { channel in channel.pipeline.addHandler(InboundHandler(owner: self)) }
+                .channelInitializer { channel in
+                    let handler = InboundHandler(owner: self)
+                    self.lock.lock()
+                    guard !self.isClosed else {
+                        self.lock.unlock()
+                        return channel.eventLoop.makeFailedFuture(NIOTransportError.closed)
+                    }
+                    self.inboundHandler = handler
+                    self.lock.unlock()
+                    return channel.pipeline.addHandler(handler)
+                }
             let future: EventLoopFuture<Channel> = bootstrap.connect(host: endpoint.host, port: endpoint.port)
             future.whenComplete { result in self.finishConnect(result) }
         }
@@ -81,7 +102,9 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
         if case .connecting = lifecycle {
             switch result {
             case .success(let channel): lifecycle = .connected(channel)
-            case .failure: lifecycle = .disconnected
+            case .failure:
+                lifecycle = .disconnected
+                inboundHandler = nil
             }
             let ready = drainReads()
             lock.unlock()
@@ -104,7 +127,7 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
                 continuation.resume(throwing: NIOTransportError.invalidReadSize)
                 return
             }
-            guard terminalError == nil, case .connected = lifecycle else {
+            guard terminalError == nil, (!tlsStarted || tlsReady), case .connected = lifecycle else {
                 let error: NIOTransportError = terminalError ?? (isClosed ? .closed : .invalidState)
                 lock.unlock()
                 continuation.resume(throwing: error)
@@ -133,7 +156,7 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     public func write(_ data: Data) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             lock.lock()
-            guard terminalError == nil, case .connected(let channel) = lifecycle else {
+            guard terminalError == nil, (!tlsStarted || tlsReady), case .connected(let channel) = lifecycle else {
                 let error: NIOTransportError = terminalError ?? (isClosed ? .closed : .invalidState)
                 lock.unlock()
                 continuation.resume(throwing: error)
@@ -145,16 +168,27 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
             lock.unlock()
             submissionHook?()
             defer { finishSubmission() }
-            var buffer = channel.allocator.buffer(capacity: data.count)
-            buffer.writeBytes(data)
-            let future: EventLoopFuture<Void> = channel.writeAndFlush(buffer)
-            future.whenComplete { result in
+            channel.eventLoop.execute {
                 self.lock.lock()
-                let waiter = self.writeWaiters.removeValue(forKey: id)
+                guard self.terminalError == nil, !self.isClosed, (!self.tlsStarted || self.tlsReady) else {
+                    let waiter = self.writeWaiters.removeValue(forKey: id)
+                    let failure = self.terminalError ?? .closed
+                    self.lock.unlock()
+                    waiter?.resume(throwing: failure)
+                    return
+                }
                 self.lock.unlock()
-                switch result {
-                case .success: waiter?.resume()
-                case .failure: waiter?.resume(throwing: NIOTransportError.writeFailed)
+                var buffer = channel.allocator.buffer(capacity: data.count)
+                buffer.writeBytes(data)
+                let future: EventLoopFuture<Void> = channel.writeAndFlush(buffer)
+                future.whenComplete { result in
+                    self.lock.lock()
+                    let waiter = self.writeWaiters.removeValue(forKey: id)
+                    self.lock.unlock()
+                    switch result {
+                    case .success: waiter?.resume()
+                    case .failure: waiter?.resume(throwing: NIOTransportError.writeFailed)
+                    }
                 }
             }
         }
@@ -183,7 +217,140 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     }
 
     public func upgradeToTLS(identity: ManageSieveTLSIdentityRequest) async throws {
-        throw NIOTransportError.tlsUnsupported
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                guard terminalError == nil, !tlsStarted, readWaiters.isEmpty,
+                      case .connected(let channel) = lifecycle, inboundHandler != nil else {
+                    let error = terminalError ?? (isClosed ? .closed : .invalidState)
+                    lock.unlock()
+                    continuation.resume(throwing: error)
+                    return
+                }
+                tlsStarted = true
+                handshakeWaiter = continuation
+                activeSubmissions += 1
+                lock.unlock()
+                defer { finishSubmission() }
+                do {
+                    var configuration = TLSConfiguration.makeClientConfiguration()
+                    // Keep peer verification enabled, but replace NIO's separate target/IP hostname
+                    // check with typed service identifiers in our custom verifier.
+                    configuration.certificateVerification = .noHostnameVerification
+                    let context = try NIOSSLContext(configuration: configuration)
+                    channel.eventLoop.execute {
+                        self.installTLS(context: context, identity: identity, channel: channel)
+                    }
+                } catch { failTLS(.tlsHandshakeFailed) }
+            }
+        } onCancel: {
+            Task { await self.close() }
+        }
+    }
+
+    // All pipeline mutation, unread-suffix extraction, and replay run in one event-loop turn.
+    private func installTLS(context: NIOSSLContext, identity: ManageSieveTLSIdentityRequest, channel: Channel) {
+        channel.eventLoop.preconditionInEventLoop()
+        do {
+            guard let options = channel.syncOptions else { throw NIOTransportError.invalidState }
+            let oldAutoRead = try options.getOption(ChannelOptions.autoRead)
+            try options.setOption(ChannelOptions.autoRead, value: false)
+            lock.lock()
+            guard terminalError == nil, !isClosed, handshakeWaiter != nil, let inbound = inboundHandler else {
+                lock.unlock()
+                throw NIOTransportError.closed
+            }
+            let suffix = received
+            received.removeAll()
+            lock.unlock()
+            inbound.preTLSAutoRead = oldAutoRead
+            // SNI is routing metadata only; it is never added to the reference identifiers.
+            let hostname = (try? SocketAddress(ipAddress: endpoint.host, port: endpoint.port)) == nil ? endpoint.host : nil
+            let handler = try NIOSSLClientHandler(context: context, serverHostname: hostname) { chain, promise in
+                self.verify(chain: chain, identity: identity, promise: promise)
+            }
+            try channel.pipeline.syncOperations.addHandler(handler, position: .before(inbound))
+            if !suffix.isEmpty {
+                var buffer = channel.allocator.buffer(capacity: suffix.count)
+                buffer.writeBytes(suffix)
+                channel.pipeline.fireChannelRead(buffer)
+                channel.pipeline.fireChannelReadComplete()
+            }
+            // NIOSSL drives subsequent manual reads until Finished restores the previous mode.
+            channel.read()
+        } catch { failTLS(.tlsHandshakeFailed) }
+    }
+
+    private func verify(chain: [NIOSSLCertificate], identity: ManageSieveTLSIdentityRequest, promise: EventLoopPromise<NIOSSLVerificationResult>) {
+        lock.lock()
+        guard !isClosed, terminalError == nil, handshakeWaiter != nil else {
+            lock.unlock()
+            promise.succeed(.failed)
+            return
+        }
+        verificationPromise = promise
+        lock.unlock()
+        // Security trust and X509 parsing must not run on the channel's event loop.
+        Task.detached {
+            let result: Result<Void, NIOTransportError>
+            do {
+                let der: [Data]
+                do { der = try chain.map { Data(try $0.toDERBytes()) } }
+                catch { throw NIOTransportError.tlsTrustFailed }
+                do { try await self.trustEvaluator.evaluate(certificateChainDER: der) }
+                catch { throw NIOTransportError.tlsTrustFailed }
+                do {
+                    let certificates = try der.map { try Certificate(derEncoded: Array($0)) }
+                    try ManageSieveTLSIdentityValidator().validate(certificateChain: certificates, identifiers: identity.referenceIdentifiers)
+                } catch { throw NIOTransportError.tlsIdentityFailed }
+                result = .success(())
+            } catch { result = .failure(error as? NIOTransportError ?? .tlsTrustFailed) }
+            self.finishVerification(result)
+        }
+    }
+
+    private func finishVerification(_ result: Result<Void, NIOTransportError>) {
+        lock.lock()
+        let promise = verificationPromise
+        verificationPromise = nil
+        guard let promise else { lock.unlock(); return }
+        let active = !isClosed && terminalError == nil && handshakeWaiter != nil
+        if active, case .success = result { tlsVerified = true }
+        if active, case .failure(let failure) = result { terminalError = failure }
+        lock.unlock()
+        if active, case .success = result { promise.succeed(.certificateVerified) }
+        else {
+            promise.succeed(.failed)
+            if active, case .failure(let failure) = result { failTLS(failure) }
+        }
+    }
+
+    private func handshakeCompleted(channel: Channel, autoRead: Bool) {
+        channel.setOption(ChannelOptions.autoRead, value: autoRead).whenComplete { result in
+            self.lock.lock()
+            guard self.terminalError == nil, !self.isClosed, self.tlsVerified, case .success = result else {
+                self.lock.unlock()
+                self.failTLS(.tlsHandshakeFailed)
+                return
+            }
+            self.tlsReady = true
+            let waiter = self.handshakeWaiter
+            self.handshakeWaiter = nil
+            self.lock.unlock()
+            waiter?.resume()
+        }
+    }
+
+    private func failTLS(_ error: NIOTransportError) {
+        lock.lock()
+        if !isClosed, terminalError == nil { terminalError = error }
+        let failure = terminalError ?? .closed
+        let waiter = handshakeWaiter
+        handshakeWaiter = nil
+        lock.unlock()
+        waiter?.resume(throwing: failure)
+        Task { await self.close() }
     }
 
     public func close() async {
@@ -205,14 +372,22 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
         let channel: Channel?
         if case .connected(let current) = lifecycle { channel = current } else { channel = nil }
         lifecycle = .closed
+        inboundHandler = nil
+        received.removeAll()
         let connect = connectWaiter
         connectWaiter = nil
+        let handshake = handshakeWaiter
+        handshakeWaiter = nil
+        let verification = verificationPromise
+        verificationPromise = nil
         let reads = readWaiters
         readWaiters.removeAll()
         let writes = Array(writeWaiters.values)
         writeWaiters.removeAll()
         lock.unlock()
         let failure = terminalError ?? .closed
+        verification?.succeed(.failed)
+        handshake?.resume(throwing: failure)
         connect?.resume(throwing: failure)
         for (_, waiter) in reads { waiter.resume(throwing: failure) }
         for waiter in writes { waiter.resume(throwing: failure) }
@@ -243,6 +418,11 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
 
     private func endOfStream() {
         lock.lock()
+        if tlsStarted && !tlsReady && !isClosed {
+            lock.unlock()
+            failTLS(.tlsHandshakeFailed)
+            return
+        }
         guard terminalError == nil else { lock.unlock(); return }
         eof = true
         let ready = drainReads()
@@ -253,6 +433,8 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
     private final class InboundHandler: ChannelInboundHandler {
         typealias InboundIn = ByteBuffer
         private let owner: NIOManageSieveTransport
+        // Event-loop confined; captured before insertion and restored only after verification + Finished.
+        var preTLSAutoRead: Bool?
         init(owner: NIOManageSieveTransport) { self.owner = owner }
         func channelRead(context: ChannelHandlerContext, data: NIOAny) {
             var buffer = unwrapInboundIn(data)
@@ -262,7 +444,14 @@ public final class NIOManageSieveTransport: ManageSieveTransport, @unchecked Sen
             owner.endOfStream()
             context.fireChannelInactive()
         }
+        func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+            if case .handshakeCompleted = event as? TLSUserEvent, let autoRead = preTLSAutoRead {
+                owner.handshakeCompleted(channel: context.channel, autoRead: autoRead)
+            }
+            context.fireUserInboundEventTriggered(event)
+        }
         func errorCaught(context: ChannelHandlerContext, error: Error) {
+            owner.failTLS(.tlsHandshakeFailed)
             context.close(promise: nil)
         }
     }

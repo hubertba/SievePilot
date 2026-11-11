@@ -1,6 +1,7 @@
 import Foundation
 import NIOCore
 import NIOPosix
+import NIOSSL
 import XCTest
 @testable import SievePilotCore
 
@@ -10,15 +11,27 @@ final class NIOManageSieveTransportTests: XCTestCase {
         let lock = NSLock()
         private var storedChannel: Channel?
         private var storedBytes = Data()
+        private var startTLSContext: NIOSSLContext?
+        init(startTLSContext: NIOSSLContext? = nil) { self.startTLSContext = startTLSContext }
         var channel: Channel? { lock.lock(); defer { lock.unlock() }; return storedChannel }
         var bytes: Data { lock.lock(); defer { lock.unlock() }; return storedBytes }
         func channelActive(context: ChannelHandlerContext) {
             lock.lock(); storedChannel = context.channel; lock.unlock()
+            if startTLSContext != nil { context.writeAndFlush(NIOAny(ByteBuffer(string: "\"STARTTLS\"\r\nOK\r\n")), promise: nil) }
             context.fireChannelActive()
         }
         func channelRead(context: ChannelHandlerContext, data: NIOAny) {
             var buffer = unwrapInboundIn(data)
-            lock.lock(); storedBytes.append(contentsOf: buffer.readBytes(length: buffer.readableBytes) ?? []); lock.unlock()
+            lock.lock(); storedBytes.append(contentsOf: buffer.readBytes(length: buffer.readableBytes) ?? [])
+            let command = storedBytes
+            lock.unlock()
+            if let sslContext = startTLSContext, command == Data("STARTTLS\r\n".utf8) {
+                lock.lock(); storedBytes.removeAll(); lock.unlock()
+                startTLSContext = nil
+                context.writeAndFlush(NIOAny(ByteBuffer(string: "OK\r\n")), promise: nil)
+                do { try context.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext), position: .before(self)) }
+                catch { XCTFail("Server TLS insertion failed"); context.close(promise: nil) }
+            }
         }
     }
 
@@ -236,14 +249,216 @@ final class NIOManageSieveTransportTests: XCTestCase {
         await shutdown(group)
     }
 
-    func testTLSIsUnsupportedAndCannotEnableAuthentication() async throws {
-        let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: 4190))
-        do {
-            try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: ["example.com"]))
-            XCTFail("TLS cannot succeed in Task 1")
-        } catch {
-            XCTAssertEqual(error as? NIOTransportError, .tlsUnsupported)
+    private func tlsServer(group: EventLoopGroup, recorder: ServerRecorder, fragmented: Bool = false) throws -> Channel {
+        let cert = try NIOSSLCertificate(bytes: Array(tlsFixture("server.der")), format: .der)
+        let key = try NIOSSLPrivateKey(bytes: Array(tlsFixture("server-key.pem")), format: .pem)
+        let context = try NIOSSLContext(configuration: .makeServerConfiguration(certificateChain: [.certificate(cert)], privateKey: .privateKey(key)))
+        return try ServerBootstrap(group: group)
+            .childChannelInitializer { channel in
+                let fragment = FragmentTLSWrites(enabled: fragmented)
+                do {
+                    try channel.pipeline.syncOperations.addHandler(fragment)
+                    try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: context))
+                    try channel.pipeline.syncOperations.addHandler(recorder)
+                    return channel.eventLoop.makeSucceededVoidFuture()
+                } catch { return channel.eventLoop.makeFailedFuture(error) }
+            }.bind(host: "127.0.0.1", port: 0).wait()
+    }
+
+    private func startTLSServer(group: EventLoopGroup, fragmented: Bool) throws -> (Channel, ServerRecorder) {
+        let cert = try NIOSSLCertificate(bytes: Array(tlsFixture("server.der")), format: .der)
+        let key = try NIOSSLPrivateKey(bytes: Array(tlsFixture("server-key.pem")), format: .pem)
+        let context = try NIOSSLContext(configuration: .makeServerConfiguration(certificateChain: [.certificate(cert)], privateKey: .privateKey(key)))
+        let recorder = ServerRecorder(startTLSContext: context)
+        let listener = try ServerBootstrap(group: group).childChannelInitializer { channel in
+            do {
+                try channel.pipeline.syncOperations.addHandler(FragmentTLSWrites(enabled: fragmented))
+                try channel.pipeline.syncOperations.addHandler(recorder)
+                return channel.eventLoop.makeSucceededVoidFuture()
+            } catch { return channel.eventLoop.makeFailedFuture(error) }
+        }.bind(host: "127.0.0.1", port: 0).wait()
+        return (listener, recorder)
+    }
+
+    // Event-loop confined; delayed chunks force separate socket deliveries, not just separate writes.
+    private final class FragmentTLSWrites: ChannelOutboundHandler, @unchecked Sendable {
+        typealias OutboundIn = ByteBuffer
+        typealias OutboundOut = ByteBuffer
+        let enabled: Bool
+        private var chunks: [(ByteBuffer, EventLoopPromise<Void>?)] = []
+        private var context: ChannelHandlerContext?
+        private var sending = false
+        init(enabled: Bool) { self.enabled = enabled }
+        func handlerAdded(context: ChannelHandlerContext) { self.context = context }
+        func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+            guard enabled else { context.write(data, promise: promise); return }
+            var buffer = unwrapOutboundIn(data)
+            guard buffer.readableBytes > 0 else { context.write(data, promise: promise); return }
+            while buffer.readableBytes > 0 {
+                let slice = buffer.readSlice(length: min(17, buffer.readableBytes))!
+                chunks.append((slice, buffer.readableBytes == 0 ? promise : nil))
+            }
+            if !sending { sending = true; sendNext() }
         }
+        private func sendNext() {
+            guard let context else { return }
+            guard !chunks.isEmpty else { sending = false; return }
+            let (slice, promise) = chunks.removeFirst()
+            context.write(wrapOutboundOut(slice), promise: promise)
+            context.flush()
+            context.eventLoop.scheduleTask(in: .milliseconds(1)) { self.sendNext() }
+        }
+    }
+
+    func testTLSUpgradeExistingChannelEncryptedReadWriteAndFragmentedRecords() async throws {
+        for fragmented in [false, true] {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let (listener, recorder) = try startTLSServer(group: group, fragmented: fragmented)
+            let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group, trustEvaluator: FixtureTLSChainTrustEvaluator())
+            try await transport.connect()
+            await waitUntil { recorder.channel != nil }
+            let peer = try XCTUnwrap(recorder.channel)
+            var greeting = Data()
+            while !greeting.suffix(4).elementsEqual("OK\r\n".utf8) { greeting.append(try await transport.read(maxBytes: 4096)) }
+            XCTAssertEqual(greeting, Data("\"STARTTLS\"\r\nOK\r\n".utf8))
+            try await transport.write(Data("STARTTLS\r\n".utf8))
+            for byte in "OK\r\n".utf8 { let read = try await transport.read(maxBytes: 1); XCTAssertEqual(read, Data([byte])) }
+            try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("source.example.org")]))
+            try await transport.write(Data("encrypted request".utf8))
+            await waitUntil { recorder.bytes == Data("encrypted request".utf8) }
+            try await peer.writeAndFlush(ByteBuffer(string: "encrypted response")).get()
+            var response = Data()
+            while response.count < 18 { response.append(try await transport.read(maxBytes: 4096)) }
+            XCTAssertEqual(response, Data("encrypted response".utf8))
+            await transport.close()
+            try await listener.close().get()
+            await shutdown(group)
+        }
+    }
+
+    func testTLSIdentityAndTrustFailuresAreDistinctSanitizedAndPreventWrites() async throws {
+        for trust in [true, false] {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let recorder = ServerRecorder()
+            let listener = try tlsServer(group: group, recorder: recorder)
+            let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group, trustEvaluator: FixtureTLSChainTrustEvaluator(trusted: trust))
+            try await transport.connect()
+            do {
+                try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("target.example.net")]))
+                XCTFail("Untrusted target must never authenticate")
+            } catch { XCTAssertEqual(error as? NIOTransportError, trust ? .tlsIdentityFailed : .tlsTrustFailed) }
+            do { try await transport.write(Data("password-secret".utf8)); XCTFail("No writes after failure") }
+            catch { XCTAssertFalse(String(describing: error).contains("target.example.net")) }
+            XCTAssertTrue(recorder.bytes.isEmpty)
+            await transport.close()
+            try await listener.close().get()
+            await shutdown(group)
+        }
+    }
+
+    func testProductionTransportUsesSystemTrustNotFixtureTrust() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let recorder = ServerRecorder()
+        let listener = try tlsServer(group: group, recorder: recorder)
+        let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group)
+        try await transport.connect()
+        do {
+            try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("source.example.org")]))
+            XCTFail("Test CA must not be trusted by production")
+        } catch { XCTAssertEqual(error as? NIOTransportError, .tlsTrustFailed) }
+        XCTAssertTrue(recorder.bytes.isEmpty)
         await transport.close()
+        try await listener.close().get()
+        await shutdown(group)
+    }
+
+    func testCloseAndCancellationReleaseHandshakeExactlyOnce() async throws {
+        for cancel in [false, true] {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let recorder = ServerRecorder()
+            let listener = try server(group: group, recorder: recorder)
+            let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group)
+            try await transport.connect()
+            let pending = Task { try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("source.example.org")])) }
+            await waitUntil { !recorder.bytes.isEmpty }
+            if cancel { pending.cancel() } else { await transport.close() }
+            do { try await pending.value; XCTFail("Handshake cannot succeed") }
+            catch { XCTAssertTrue(error is NIOTransportError || error is CancellationError) }
+            do { try await transport.write(Data("secret".utf8)); XCTFail("No post-failure writes") } catch {}
+            await transport.close()
+            try await listener.close().get()
+            await shutdown(group)
+        }
+    }
+
+    private actor VerificationGate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var released = false
+        func wait() async {
+            if released { return }
+            await withCheckedContinuation { continuation = $0 }
+        }
+        func release() { released = true; continuation?.resume(); continuation = nil }
+    }
+
+    private struct GatedTrustEvaluator: TLSChainTrustEvaluating {
+        let gate: VerificationGate
+        let entered: XCTestExpectation
+        func evaluate(certificateChainDER: [Data]) async throws {
+            entered.fulfill()
+            await gate.wait()
+            try await FixtureTLSChainTrustEvaluator().evaluate(certificateChainDER: certificateChainDER)
+        }
+    }
+
+    func testCloseAndCancelDuringAsyncTrustReleaseWaiterAndIgnoreLateVerification() async throws {
+        for cancel in [false, true] {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let recorder = ServerRecorder()
+            let listener = try tlsServer(group: group, recorder: recorder)
+            let gate = VerificationGate()
+            let entered = expectation(description: "asynchronous trust entered")
+            let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group, trustEvaluator: GatedTrustEvaluator(gate: gate, entered: entered))
+            try await transport.connect()
+            let pending = Task { try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("source.example.org")])) }
+            await fulfillment(of: [entered], timeout: 3)
+            let loopResponsive = try await group.next().submit { true }.get()
+            XCTAssertTrue(loopResponsive, "Trust evaluation must not block the event loop")
+            do { try await transport.write(Data("premature secret".utf8)); XCTFail("No application writes during verification") }
+            catch { XCTAssertEqual(error as? NIOTransportError, .invalidState) }
+            if cancel { pending.cancel() } else { await transport.close() }
+            do { try await pending.value; XCTFail("Closed handshake must fail") } catch {}
+            await gate.release()
+            do { try await transport.write(Data("late secret".utf8)); XCTFail("Late trust cannot resurrect transport") } catch {}
+            XCTAssertTrue(recorder.bytes.isEmpty)
+            await transport.close()
+            try await listener.close().get()
+            await shutdown(group)
+        }
+    }
+
+    func testCoalescedOKAndFirstTLSRecordSuffixIsReplayedFromPipelineHead() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let recorder = ServerRecorder()
+        let listener = try server(group: group, recorder: recorder)
+        let transport = NIOManageSieveTransport(endpoint: .init(host: "127.0.0.1", port: listener.localAddress!.port!), eventLoopGroup: group)
+        try await transport.connect()
+        await waitUntil { recorder.channel != nil }
+        // A complete TLS fatal handshake_failure alert, coalesced with the plaintext terminal line.
+        let bytes = Array("OK\r\n".utf8) + [21, 3, 3, 0, 2, 2, 40]
+        try await recorder.channel!.writeAndFlush(ByteBuffer(bytes: bytes)).get()
+        for byte in "OK\r\n".utf8 { let read = try await transport.read(maxBytes: 1); XCTAssertEqual(read, Data([byte])) }
+        let pending = Task { try await transport.upgradeToTLS(identity: .init(referenceIdentifiers: [.dns("source.example.org")])) }
+        let completed = expectation(description: "buffered alert fails handshake without another socket read")
+        let observer = Task {
+            do { try await pending.value; XCTFail("Expected TLS alert failure") }
+            catch { XCTAssertEqual(error as? NIOTransportError, .tlsHandshakeFailed) }
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 3)
+        await transport.close()
+        await observer.value
+        try await listener.close().get()
+        await shutdown(group)
     }
 }
