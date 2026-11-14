@@ -16,6 +16,8 @@ extension SieveServiceDiscovery: SieveServiceDiscovering {}
 
 protocol SieveAccountServicing: Sendable {
     func refresh(account: AccountConfiguration) async throws -> VerifiedAccountSnapshot
+    func getScript(account: AccountConfiguration, name: String) async throws -> Data
+    func deleteScript(account: AccountConfiguration, name: String) async throws -> ScriptDeletionOutcome
     func applyOutOfOffice(account: AccountConfiguration,
                           configuration: OutOfOfficeConfiguration?) async throws -> AccountMutationOutcome
 }

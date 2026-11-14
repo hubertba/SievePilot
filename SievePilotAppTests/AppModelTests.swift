@@ -107,6 +107,12 @@ actor AppService: SieveAccountServicing {
     var applyOutcomes: [Result<AccountMutationOutcome, Error>] = []
     var applied: [OutOfOfficeConfiguration?] = []
     var applyGate: Gate?
+    var scriptsByName: [String: Data] = [:]
+    var getScriptCalls: [String] = []
+    var getScriptError: Error?
+    var deletionOutcomes: [Result<ScriptDeletionOutcome, Error>] = []
+    var deletedScriptNames: [String] = []
+    var deletionGate: Gate?
     func refresh(account: AccountConfiguration) async throws -> VerifiedAccountSnapshot {
         refreshCount += 1
         if let error { throw error }
@@ -117,6 +123,18 @@ actor AppService: SieveAccountServicing {
         let currentDelay = delay
         if currentDelay > 0 { try await Task.sleep(nanoseconds: currentDelay) }
         return snapshot
+    }
+    func getScript(account: AccountConfiguration, name: String) async throws -> Data {
+        getScriptCalls.append(name)
+        if let getScriptError { throw getScriptError }
+        guard let data = scriptsByName[name] else { throw NSError(domain: "missing-script", code: 1) }
+        return data
+    }
+    func deleteScript(account: AccountConfiguration, name: String) async throws -> ScriptDeletionOutcome {
+        deletedScriptNames.append(name)
+        await deletionGate?.wait()
+        guard !deletionOutcomes.isEmpty else { return .unknown }
+        return try deletionOutcomes.removeFirst().get()
     }
     func enqueue(_ snapshot: VerifiedAccountSnapshot) { snapshots.append(snapshot) }
     func applyOutOfOffice(account: AccountConfiguration, configuration: OutOfOfficeConfiguration?) async throws -> AccountMutationOutcome {
@@ -129,6 +147,12 @@ actor AppService: SieveAccountServicing {
     func appliedConfigurations() -> [OutOfOfficeConfiguration?] { applied }
     func refreshCalls() -> Int { refreshCount }
     func setApplyGate(_ value: Gate?) { applyGate = value }
+    func setScripts(_ scripts: [String: Data]) { scriptsByName = scripts }
+    func scriptFetchNames() -> [String] { getScriptCalls }
+    func setGetScriptError(_ error: Error?) { getScriptError = error }
+    func enqueueDeletion(_ outcome: Result<ScriptDeletionOutcome, Error>) { deletionOutcomes.append(outcome) }
+    func deletionNames() -> [String] { deletedScriptNames }
+    func setDeletionGate(_ value: Gate?) { deletionGate = value }
 }
 
 @MainActor
@@ -184,10 +208,22 @@ final class AppModelTests: XCTestCase {
         await existing.load()
         XCTAssertEqual(existing.persistedAccount, try account(manual: true))
         XCTAssertEqual(existing.emailAddress, "user@example.org")
+        XCTAssertEqual(existing.username, "user")
         XCTAssertFalse(existing.usesAutomaticDiscovery)
         XCTAssertEqual(existing.manualHost, "mail.example.org")
         XCTAssertEqual(existing.manualPort, "4190")
         XCTAssertEqual(existing.operationState, .stale)
+    }
+
+    func testEmailAddressPrefillsUsernameUntilIndependentlyEdited() {
+        let model = model()
+        model.emailAddress = "user@example.org"
+        XCTAssertEqual(model.username, "user@example.org")
+        model.emailAddress = "other@example.org"
+        XCTAssertEqual(model.username, "other@example.org")
+        model.username = "custom"
+        model.emailAddress = "third@example.org"
+        XCTAssertEqual(model.username, "custom")
     }
 
     func testAutomaticDiscoveryPreviewAndSuccessfulTestSave() async throws {
@@ -204,6 +240,35 @@ final class AppModelTests: XCTestCase {
         let callCount = await sessions.callCount()
         XCTAssertEqual(saveCount, 1)
         XCTAssertEqual(callCount, 1)
+    }
+
+    func testIdentityFailureAfterDiscoveryOffersDiscoveredHostForRetry() async throws {
+        let persistence = AppPersistence(), discovery = AppDiscovery(), sessions = AppSessionProvider()
+        await discovery.enqueue(.init(host: "srv.example.net", port: 4190, referenceIdentifiers: [.dns("example.org")]))
+        await sessions.setError(ManageSieveClientError.tlsIdentityFailed)
+        let model = model(persistence: persistence, discovery: discovery, sessions: sessions)
+        model.emailAddress = "user@example.org"
+        model.password = "hunter2"
+        await model.testAndSave()
+        XCTAssertEqual(model.userFacingError, AppModel.FailureCategory.tlsIdentity.message)
+        XCTAssertTrue(model.userFacingError?.contains("Test & Save again") ?? false)
+        XCTAssertFalse(model.usesAutomaticDiscovery)
+        XCTAssertEqual(model.manualHost, "srv.example.net")
+        XCTAssertEqual(model.manualPort, "4190")
+        XCTAssertEqual(model.discoveryPreview, "srv.example.net:4190")
+        XCTAssertEqual(model.username, "user@example.org")
+        XCTAssertNil(model.persistedAccount)
+        XCTAssertEqual(model.password, "hunter2")
+        let failedSaves = await persistence.saveCount()
+        XCTAssertEqual(failedSaves, 0)
+
+        await sessions.setError(nil)
+        await model.testAndSave()
+        XCTAssertEqual(model.persistedAccount?.endpointPolicy, .manual(host: "srv.example.net", port: 4190))
+        XCTAssertEqual(model.persistedAccount?.username, "user@example.org")
+        XCTAssertEqual(model.operationState, .stale)
+        let saveCount = await persistence.saveCount()
+        XCTAssertEqual(saveCount, 1)
     }
 
     func testManualFallbackValidationAndFailedTestNeverPersist() async throws {

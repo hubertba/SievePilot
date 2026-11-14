@@ -34,8 +34,15 @@ final class AppModel: ObservableObject {
         case invalidLocalTime
     }
 
-    @Published var emailAddress = ""
-    @Published var username = ""
+    @Published var emailAddress = "" {
+        didSet { mirrorEmailIntoUsernameIfNeeded(previousEmail: oldValue) }
+    }
+    @Published var username = "" {
+        didSet {
+            guard !isPopulatingAccountForm else { return }
+            usernameFollowsEmail = username.isEmpty || username == emailAddress
+        }
+    }
     @Published var password = ""
     @Published var usesAutomaticDiscovery = true
     @Published var manualHost = ""
@@ -47,8 +54,16 @@ final class AppModel: ObservableObject {
         }
     }
     @Published private(set) var operationState: OperationState = .idle
-    @Published private(set) var verifiedSnapshot: VerifiedAccountSnapshot?
+    @Published private(set) var verifiedSnapshot: VerifiedAccountSnapshot? {
+        didSet {
+            if verifiedSnapshot == nil { clearSelectedScript() }
+        }
+    }
     @Published var userFacingError: String?
+    @Published private(set) var selectedScriptName: String?
+    @Published private(set) var selectedScriptBytes: Data?
+    @Published private(set) var isLoadingSelectedScript = false
+    @Published private(set) var scriptInspectError: String?
     @Published private(set) var hasUnresolvedConflict = false
     @Published private(set) var ruleOrderingAcknowledged = false
     /// Extensions the server reported missing when the core failed closed before returning a snapshot.
@@ -64,14 +79,14 @@ final class AppModel: ObservableObject {
     @Published var repeatedTimeOffset: Int?
 
     private enum Operation {
-        case load, testAndSave, refresh, delete, apply
+        case load, testAndSave, refresh, delete, deleteScript, apply
 
         var state: OperationState {
             switch self {
             case .load, .delete: return .loading
             case .testAndSave: return .testing
             case .refresh: return .refreshing
-            case .apply: return .applying
+            case .deleteScript, .apply: return .applying
             }
         }
 
@@ -99,7 +114,10 @@ final class AppModel: ObservableObject {
     private var scheduledRefresh: Task<Void, Never>?
     private var invalidatedDuringCritical = false
     private var isPopulatingForm = false
+    private var isPopulatingAccountForm = false
+    private var usernameFollowsEmail = true
     private var formIsDirty = false
+    private var inspectToken = 0
 
     private static let requiredExtensions = ["vacation", "date", "relational"]
 
@@ -175,16 +193,29 @@ final class AppModel: ObservableObject {
                 let configuration = try configurationFromForm()
                 guard !password.isEmpty else { throw SetupFormError.missingPassword }
                 let candidate = Data(password.utf8)
+                var discovered: SieveServiceEndpoint?
                 if usesAutomaticDiscovery {
                     let endpoint = try await discovery.discover(emailAddress: configuration.emailAddress)
                     guard isCurrent(token) else { return }
                     discoveryPreview = "\(endpoint.host):\(endpoint.port)"
+                    discovered = endpoint
                 } else {
                     discoveryPreview = nil
                 }
                 // Authenticate with the candidate form password; nothing is persisted until this succeeds.
-                _ = try await sessionProvider.withAuthenticatedSession(account: configuration,
-                                                                       password: candidate) { _ in true }
+                do {
+                    _ = try await sessionProvider.withAuthenticatedSession(account: configuration,
+                                                                           password: candidate) { _ in true }
+                } catch {
+                    // Identity is checked against the email domain, not the unauthenticated SRV target.
+                    // Surface that target as an explicit manual host so a retry uses it as the DNS-ID.
+                    if usesAutomaticDiscovery, let discovered, FailureCategory(error) == .tlsIdentity {
+                        usesAutomaticDiscovery = false
+                        manualHost = discovered.host
+                        manualPort = String(discovered.port)
+                    }
+                    throw error
+                }
                 guard isCurrent(token) else { return }
                 guard !Task.isCancelled else { throw CancellationError() }
                 let persistence = persistence
@@ -222,6 +253,7 @@ final class AppModel: ObservableObject {
                 adopt(snapshot)
                 userFacingError = nil
                 operationState = .verified
+                await loadSelectedScriptIfNeeded()
             } catch is CancellationError {
                 finishCancellation(token)
             } catch {
@@ -338,6 +370,45 @@ final class AppModel: ObservableObject {
     func showSettings() { isShowingSettings = true }
     func closeSettings() { isShowingSettings = false }
 
+    // MARK: Script deletion
+
+    var canDeleteSelectedScript: Bool {
+        persistedAccount != nil && selectedScriptEntry != nil && activeOperation == nil
+    }
+
+    func deleteScript(named name: String) async {
+        guard let account = persistedAccount, activeOperation == nil,
+              listedScripts.contains(where: { $0.name == name }) else { return }
+        await run(.deleteScript) { [self] token in
+            do {
+                let outcome = try await accountService.deleteScript(account: account, name: name)
+                guard isCurrent(token) else { return }
+                switch outcome {
+                case .verified(let snapshot):
+                    if selectedScriptName == name { clearSelectedScript() }
+                    adopt(snapshot)
+                    userFacingError = nil
+                    operationState = invalidatedDuringCritical ? .stale : .verified
+                    await loadSelectedScriptIfNeeded()
+                case .unknown:
+                    userFacingError = "SievePilot could not verify whether the script was deleted. Refresh to check the server before trying again."
+                    operationState = .unknown
+                }
+            } catch is CancellationError {
+                finishCancellation(token)
+            } catch SieveAccountServiceError.scriptDeactivationRejected {
+                finishFailure(token, message: "The server refused to deactivate the active script, so it was not deleted. Refresh to verify the server state.")
+            } catch SieveAccountServiceError.scriptDeletionRejected(let deactivated) {
+                let message = deactivated
+                    ? "The script was deactivated but the server refused to delete it. It remains stored and inactive, and no Sieve script is active. Refresh to verify the server state."
+                    : "The server refused to delete the script. Refresh to verify the server state."
+                finishFailure(token, message: message)
+            } catch {
+                finishFailure(token, error: error, fallback: "Unable to delete the script. Refresh to verify the server state.")
+            }
+        }
+    }
+
     // MARK: Out-of-office mutations
 
     func saveAndActivate() async {
@@ -377,6 +448,7 @@ final class AppModel: ObservableObject {
                     adopt(snapshot)
                     userFacingError = nil
                     operationState = invalidatedDuringCritical ? .stale : .verified
+                    await loadSelectedScriptIfNeeded()
                 case .conflict:
                     hasUnresolvedConflict = true
                     userFacingError = "The active script changed elsewhere, so nothing was activated. Refresh to review the current server state, then try again."
@@ -427,6 +499,41 @@ final class AppModel: ObservableObject {
     }
 
     var isOutOfOfficeAvailable: Bool { missingCapabilities.isEmpty }
+
+    /// Names and active flags from the last verified `LISTSCRIPTS`. Empty until a snapshot exists.
+    var listedScripts: [ManageSieveScriptEntry] { verifiedSnapshot?.scripts ?? [] }
+
+    var selectedScriptEntry: ManageSieveScriptEntry? {
+        listedScripts.first { $0.name == selectedScriptName }
+    }
+
+    /// UTF-8 source of the selected script, or `nil` when the body is missing or not UTF-8.
+    var selectedScriptSource: String? {
+        guard let selectedScriptBytes else { return nil }
+        return String(data: selectedScriptBytes, encoding: .utf8)
+    }
+
+    /// Parsed SievePilot out-of-office configuration of the selected script, if any.
+    var selectedScriptOutOfOfficeState: VerifiedOutOfOfficeState? {
+        guard selectedScriptBytes != nil, !isLoadingSelectedScript else { return nil }
+        return OutOfOfficeStateEvaluator.evaluate(activeScript: selectedScriptBytes, now: now())
+    }
+
+    /// Loads `name` with `GETSCRIPT` when it is not the already-fetched active script.
+    func selectScript(_ name: String) async {
+        guard listedScripts.contains(where: { $0.name == name }) else { return }
+        if selectedScriptName == name, selectedScriptBytes != nil || isLoadingSelectedScript { return }
+        inspectToken += 1
+        selectedScriptName = name
+        scriptInspectError = nil
+        if name == verifiedSnapshot?.activeScriptName {
+            selectedScriptBytes = verifiedSnapshot?.activeScript
+            isLoadingSelectedScript = false
+            return
+        }
+        selectedScriptBytes = nil
+        await loadSelectedScriptIfNeeded()
+    }
 
     var capabilityLimitations: [String] {
         var result: [String] = []
@@ -555,6 +662,56 @@ final class AppModel: ObservableObject {
 
     private func formDidChange() { if !isPopulatingForm { formIsDirty = true } }
 
+    private func clearSelectedScript() {
+        inspectToken += 1
+        selectedScriptName = nil
+        selectedScriptBytes = nil
+        isLoadingSelectedScript = false
+        scriptInspectError = nil
+    }
+
+    /// Keeps the current selection when it is still listed; otherwise falls back to the active script.
+    private func syncScriptSelection(with snapshot: VerifiedAccountSnapshot) {
+        inspectToken += 1
+        let names = Set(snapshot.scripts.map(\.name))
+        let selected = selectedScriptName.flatMap { names.contains($0) ? $0 : nil }
+            ?? snapshot.scripts.first(where: \.isActive)?.name
+            ?? snapshot.scripts.first?.name
+        selectedScriptName = selected
+        scriptInspectError = nil
+        if selected == snapshot.activeScriptName {
+            selectedScriptBytes = snapshot.activeScript
+            isLoadingSelectedScript = false
+        } else {
+            selectedScriptBytes = nil
+            isLoadingSelectedScript = selected != nil
+        }
+    }
+
+    /// `GETSCRIPT` for an inactive selection. The active script is already in the snapshot.
+    private func loadSelectedScriptIfNeeded() async {
+        guard let account = persistedAccount, let name = selectedScriptName else { return }
+        guard name != verifiedSnapshot?.activeScriptName else { return }
+        guard selectedScriptBytes == nil else { return }
+        inspectToken += 1
+        let token = inspectToken
+        isLoadingSelectedScript = true
+        scriptInspectError = nil
+        do {
+            let data = try await accountService.getScript(account: account, name: name)
+            guard token == inspectToken, selectedScriptName == name else { return }
+            selectedScriptBytes = data
+            isLoadingSelectedScript = false
+        } catch is CancellationError {
+            guard token == inspectToken else { return }
+            isLoadingSelectedScript = false
+        } catch {
+            guard token == inspectToken else { return }
+            isLoadingSelectedScript = false
+            scriptInspectError = "Unable to load this script."
+        }
+    }
+
     private func expiryDidChange() {
         repeatedTimeOffset = nil
         formDidChange()
@@ -579,6 +736,7 @@ final class AppModel: ObservableObject {
         verifiedSnapshot = snapshot
         hasUnresolvedConflict = false
         reportedMissingCapabilities = []
+        syncScriptSelection(with: snapshot)
         guard !formIsDirty else { return }
         switch snapshot.outOfOfficeState {
         case .on(let configuration), .expiryPassedServerClockApplies(let configuration):
@@ -675,6 +833,7 @@ final class AppModel: ObservableObject {
     }
 
     private func populateForm(from account: AccountConfiguration) {
+        isPopulatingAccountForm = true
         emailAddress = account.emailAddress
         username = account.username
         switch account.endpointPolicy {
@@ -686,6 +845,15 @@ final class AppModel: ObservableObject {
             manualHost = host
             manualPort = String(port)
         }
+        isPopulatingAccountForm = false
+        usernameFollowsEmail = username.isEmpty || username == emailAddress
+    }
+
+    private func mirrorEmailIntoUsernameIfNeeded(previousEmail: String) {
+        guard !isPopulatingAccountForm else { return }
+        guard usernameFollowsEmail || username.isEmpty || username == previousEmail else { return }
+        if username != emailAddress { username = emailAddress }
+        usernameFollowsEmail = true
     }
 }
 
@@ -729,7 +897,7 @@ extension AppModel {
             case .tlsTrust:
                 "The server's certificate is not trusted by this Mac, so SievePilot did not sign in."
             case .tlsIdentity:
-                "The server's certificate does not match the name expected for this account, so SievePilot did not sign in. If your provider uses a different server name, turn off \"Discover server automatically\" and enter that name."
+                "The server's certificate does not match the name expected for this account, so SievePilot did not sign in. If a server name is shown, Test & Save again to use that name. Otherwise turn off \"Discover server automatically\" and enter the name from your provider."
             case .tlsUnavailable:
                 "A secure (TLS) connection to the server could not be established, so SievePilot did not sign in."
             case .authenticationRejected:
@@ -797,7 +965,9 @@ extension AppModel {
                 case .quotaExceeded: self = .quota
                 case .activationRejected: self = .activation
                 case .manifest: self = .localRecord
-                case .unsupportedCapabilities, .nameGenerationFailed: return nil
+                case .unsupportedCapabilities, .nameGenerationFailed,
+                     .scriptDeactivationRejected, .scriptDeletionRejected:
+                    return nil
                 }
             case is AccountPersistenceError:
                 self = .accountStorage

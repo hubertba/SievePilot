@@ -42,8 +42,11 @@ final class OutOfOfficeFlowTests: XCTestCase {
     }
 
     private func snapshot(_ state: VerifiedOutOfOfficeState = .off, sieve: String = "vacation date relational",
-                          at verifiedAt: TimeInterval = 1_800_000_000) -> VerifiedAccountSnapshot {
-        VerifiedAccountSnapshot(activeScriptName: nil, activeScript: nil, outOfOfficeState: state,
+                          at verifiedAt: TimeInterval = 1_800_000_000,
+                          scripts: [ManageSieveScriptEntry] = [],
+                          activeScript: Data? = nil) -> VerifiedAccountSnapshot {
+        VerifiedAccountSnapshot(activeScriptName: scripts.first(where: \.isActive)?.name, activeScript: activeScript,
+                                scripts: scripts, outOfOfficeState: state,
                                 verifiedAt: Date(timeIntervalSince1970: verifiedAt),
                                 capabilities: AppSession(sieve: sieve).capabilities)
     }
@@ -107,6 +110,7 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.service.enqueue(snapshot(.off))
         await h.model.refresh()
         XCTAssertEqual(h.model.outOfOfficeStatus.label, "Verified Off")
+        XCTAssertEqual(h.model.listedScripts, [])
 
         await h.service.enqueue(snapshot(.expiryPassedServerClockApplies(configuration: parsed(expiry: 10))))
         await h.model.refresh()
@@ -115,6 +119,227 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.service.enqueue(snapshot(.malformed(reason: "x")))
         await h.model.refresh()
         XCTAssertEqual(h.model.outOfOfficeStatus.label, "Unknown — verification required")
+    }
+
+    func testRefreshExposesEveryListedScriptNameAndActiveFlag() async throws {
+        let h = try await harness()
+        let scripts = [
+            ManageSieveScriptEntry(name: "keep", isActive: false),
+            ManageSieveScriptEntry(name: "sievepilot-vacation", isActive: true),
+        ]
+        await h.service.enqueue(snapshot(.off, scripts: scripts, activeScript: Data("require \"vacation\";\n".utf8)))
+        await h.model.refresh()
+        XCTAssertEqual(h.model.listedScripts, scripts)
+        XCTAssertEqual(h.model.listedScripts.first(where: \.isActive)?.name, "sievepilot-vacation")
+        XCTAssertEqual(h.model.selectedScriptName, "sievepilot-vacation")
+        XCTAssertEqual(h.model.selectedScriptSource, "require \"vacation\";\n")
+        let fetchedAfterRefresh = await h.service.scriptFetchNames()
+        XCTAssertEqual(fetchedAfterRefresh, [])
+    }
+
+    func testSelectingAnotherScriptShowsItsContentAndConfiguration() async throws {
+        let h = try await harness()
+        let scripts = [
+            ManageSieveScriptEntry(name: "keep", isActive: false),
+            ManageSieveScriptEntry(name: "old-vacation", isActive: false),
+            ManageSieveScriptEntry(name: "sievepilot-vacation", isActive: true),
+        ]
+        let active = Data("require \"vacation\";\n".utf8)
+        await h.service.enqueue(snapshot(.off, scripts: scripts, activeScript: active))
+        await h.model.refresh()
+
+        await h.service.setScripts(["keep": Data("keep;\n".utf8)])
+        await h.model.selectScript("keep")
+        XCTAssertEqual(h.model.selectedScriptName, "keep")
+        XCTAssertEqual(h.model.selectedScriptSource, "keep;\n")
+        XCTAssertEqual(h.model.selectedScriptOutOfOfficeState, .off)
+        XCTAssertEqual(h.model.selectedScriptEntry?.isActive, false)
+        let fetchedKeep = await h.service.scriptFetchNames()
+        XCTAssertEqual(fetchedKeep, ["keep"])
+
+        let metadata = try ManagedScriptMetadata(accountID: id, versionID: UUID(), predecessorSHA256: nil)
+        let managed = try OutOfOfficeConfiguration(
+            emailAddress: "user@example.org", subject: "Away", message: "Back soon",
+            expiry: .init(instant: Date(timeIntervalSince1970: 1_800_100_000),
+                          timeZoneIdentifier: "UTC", utcOffsetSeconds: 0)
+        )
+        let managedBytes = try SieveScriptPatcher.apply(.enable(managed), to: Data(), metadata: metadata, accountID: id)
+        await h.service.setScripts(["old-vacation": managedBytes])
+        await h.model.selectScript("old-vacation")
+        XCTAssertEqual(h.model.selectedScriptName, "old-vacation")
+        XCTAssertEqual(h.model.selectedScriptSource, String(data: managedBytes, encoding: .utf8))
+        guard case .on(let configuration) = h.model.selectedScriptOutOfOfficeState else {
+            return XCTFail("expected SievePilot configuration")
+        }
+        XCTAssertEqual(configuration.subject, "Away")
+        XCTAssertEqual(configuration.message, "Back soon")
+        XCTAssertEqual(configuration.emailAddress, "user@example.org")
+        XCTAssertEqual(configuration.expiryInstant, Date(timeIntervalSince1970: 1_800_100_000))
+
+        await h.model.selectScript("sievepilot-vacation")
+        XCTAssertEqual(h.model.selectedScriptSource, "require \"vacation\";\n")
+        let fetchedInactive = await h.service.scriptFetchNames()
+        XCTAssertEqual(fetchedInactive, ["keep", "old-vacation"])
+    }
+
+    func testSelectingAnotherScriptReportsLoadFailureWithoutClearingVerification() async throws {
+        let h = try await harness()
+        let scripts = [
+            ManageSieveScriptEntry(name: "keep", isActive: false),
+            ManageSieveScriptEntry(name: "sievepilot-vacation", isActive: true),
+        ]
+        await h.service.enqueue(snapshot(.off, scripts: scripts, activeScript: Data("keep;\n".utf8)))
+        await h.model.refresh()
+        await h.service.setGetScriptError(NSError(domain: "test", code: 1))
+        await h.model.selectScript("keep")
+        XCTAssertEqual(h.model.scriptInspectError, "Unable to load this script.")
+        XCTAssertNil(h.model.selectedScriptBytes)
+        XCTAssertEqual(h.model.outOfOfficeStatus, .verifiedOff)
+        XCTAssertNil(h.model.userFacingError)
+    }
+
+    func testDeleteSelectedScriptAdoptsVerifiedSnapshotAndMovesOffDeletedSelection() async throws {
+        let h = try await harness()
+        let scripts = [
+            ManageSieveScriptEntry(name: "active", isActive: true),
+            ManageSieveScriptEntry(name: "old", isActive: false),
+        ]
+        let activeBytes = Data("keep;\n".utf8)
+        await h.service.enqueue(snapshot(.off, scripts: scripts, activeScript: activeBytes))
+        await h.model.refresh()
+        await h.service.setScripts(["old": Data("discard;\n".utf8)])
+        await h.model.selectScript("old")
+        await h.service.enqueueDeletion(.success(.verified(snapshot(.off,
+            scripts: [.init(name: "active", isActive: true)], activeScript: activeBytes))))
+
+        await h.model.deleteScript(named: "old")
+
+        let deletionNames = await h.service.deletionNames()
+        XCTAssertEqual(deletionNames, ["old"])
+        XCTAssertEqual(h.model.listedScripts, [.init(name: "active", isActive: true)])
+        XCTAssertEqual(h.model.selectedScriptName, "active")
+        XCTAssertEqual(h.model.selectedScriptSource, "keep;\n")
+        XCTAssertEqual(h.model.operationState, .verified)
+    }
+
+    func testDeleteSelectedActiveScriptCanLeaveNoActiveScript() async throws {
+        let h = try await harness()
+        await h.service.enqueue(snapshot(.on(configuration: parsed()),
+                                         scripts: [.init(name: "active", isActive: true)],
+                                         activeScript: Data("keep;\n".utf8)))
+        await h.model.refresh()
+        await h.service.enqueueDeletion(.success(.verified(snapshot(.off))))
+
+        await h.model.deleteScript(named: "active")
+
+        XCTAssertTrue(h.model.listedScripts.isEmpty)
+        XCTAssertNil(h.model.selectedScriptName)
+        XCTAssertNil(h.model.selectedScriptBytes)
+        XCTAssertEqual(h.model.outOfOfficeStatus, .verifiedOff)
+    }
+
+    func testDeleteScriptUnknownOutcomeRequiresRefresh() async throws {
+        let h = try await harness()
+        await h.service.enqueue(snapshot(.off, scripts: [.init(name: "old", isActive: false)]))
+        await h.model.refresh()
+        await h.service.enqueueDeletion(.success(.unknown))
+
+        await h.model.deleteScript(named: "old")
+
+        XCTAssertEqual(h.model.operationState, .unknown)
+        XCTAssertEqual(h.model.userFacingError,
+                       "SievePilot could not verify whether the script was deleted. Refresh to check the server before trying again.")
+        XCTAssertEqual(h.model.outOfOfficeStatus, .unknown)
+    }
+
+    func testDeleteScriptUsesConfirmedNameEvenIfSelectionChanges() async throws {
+        let h = try await harness()
+        let scripts = [
+            ManageSieveScriptEntry(name: "active", isActive: true),
+            ManageSieveScriptEntry(name: "old", isActive: false),
+        ]
+        await h.service.enqueue(snapshot(.off, scripts: scripts, activeScript: Data("keep;\n".utf8)))
+        await h.model.refresh()
+        await h.service.setScripts(["old": Data("discard;\n".utf8)])
+        await h.model.selectScript("old")
+        await h.model.selectScript("active")
+        await h.service.enqueueDeletion(.success(.verified(snapshot(.off,
+            scripts: [.init(name: "active", isActive: true)], activeScript: Data("keep;\n".utf8)))))
+
+        await h.model.deleteScript(named: "old")
+
+        let deletionNames = await h.service.deletionNames()
+        XCTAssertEqual(deletionNames, ["old"])
+    }
+
+    func testDeleteScriptDisablesAnotherDeleteWhileInFlight() async throws {
+        let h = try await harness()
+        let gate = Gate()
+        await h.service.enqueue(snapshot(.off, scripts: [.init(name: "old", isActive: false)]))
+        await h.model.refresh()
+        await h.service.setDeletionGate(gate)
+        await h.service.enqueueDeletion(.success(.verified(snapshot(.off))))
+
+        let first = Task { @MainActor in await h.model.deleteScript(named: "old") }
+        await eventually { await h.service.deletionNames().count == 1 }
+        XCTAssertTrue(h.model.isOperationInProgress)
+        XCTAssertFalse(h.model.canDeleteSelectedScript)
+
+        let second = Task { @MainActor in await h.model.deleteScript(named: "old") }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let namesWhileBlocked = await h.service.deletionNames()
+        XCTAssertEqual(namesWhileBlocked, ["old"])
+
+        await gate.open()
+        await first.value
+        await second.value
+    }
+
+    func testLifecycleInvalidationDuringVerifiedDeleteLeavesStateStale() async throws {
+        let h = try await harness()
+        let gate = Gate()
+        await h.service.enqueue(snapshot(.off, scripts: [.init(name: "old", isActive: false)]))
+        await h.model.refresh()
+        await h.service.setDeletionGate(gate)
+        await h.service.enqueueDeletion(.success(.verified(snapshot(.off))))
+
+        let deletion = Task { @MainActor in await h.model.deleteScript(named: "old") }
+        await eventually { await h.service.deletionNames().count == 1 }
+        await h.model.handle(.networkLost)
+        await gate.open()
+        await deletion.value
+
+        XCTAssertEqual(h.model.operationState, .stale)
+        XCTAssertTrue(h.model.listedScripts.isEmpty)
+        XCTAssertNil(h.model.verifiedAt)
+    }
+
+    func testDeleteRejectionAfterDeactivationExplainsInactiveState() async throws {
+        let h = try await harness()
+        await h.service.enqueue(snapshot(.off, scripts: [.init(name: "active", isActive: true)],
+                                         activeScript: Data("keep;\n".utf8)))
+        await h.model.refresh()
+        await h.service.enqueueDeletion(.failure(SieveAccountServiceError.scriptDeletionRejected(deactivated: true)))
+
+        await h.model.deleteScript(named: "active")
+
+        XCTAssertEqual(h.model.userFacingError,
+                       "The script was deactivated but the server refused to delete it. It remains stored and inactive, and no Sieve script is active. Refresh to verify the server state.")
+        XCTAssertEqual(h.model.operationState, .error)
+    }
+
+    func testDeactivationRejectionSaysScriptWasNotDeleted() async throws {
+        let h = try await harness()
+        await h.service.enqueue(snapshot(.off, scripts: [.init(name: "active", isActive: true)],
+                                         activeScript: Data("keep;\n".utf8)))
+        await h.model.refresh()
+        await h.service.enqueueDeletion(.failure(SieveAccountServiceError.scriptDeactivationRejected))
+
+        await h.model.deleteScript(named: "active")
+
+        XCTAssertEqual(h.model.userFacingError,
+                       "The server refused to deactivate the active script, so it was not deleted. Refresh to verify the server state.")
+        XCTAssertEqual(h.model.operationState, .error)
     }
 
     func testVerifiedOnBecomesExpiryPassedWhenLocalClockPassesExpiry() async throws {
