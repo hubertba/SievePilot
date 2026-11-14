@@ -4,15 +4,21 @@ struct SetupView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Form {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(AppModel.productName).font(.headline)
             StatusBanner(state: model.operationState, message: model.userFacingError)
             TextField("Email address", text: $model.emailAddress)
+                .textFieldStyle(.roundedBorder)
             TextField("Username", text: $model.username)
+                .textFieldStyle(.roundedBorder)
             SecureField("Password", text: $model.password)
+                .textFieldStyle(.roundedBorder)
             Toggle("Discover server automatically", isOn: $model.usesAutomaticDiscovery)
             if !model.usesAutomaticDiscovery {
                 TextField("Server", text: $model.manualHost)
+                    .textFieldStyle(.roundedBorder)
                 TextField("Port", text: $model.manualPort)
+                    .textFieldStyle(.roundedBorder)
             }
             if let preview = model.discoveryPreview {
                 LabeledContent("Discovered server", value: preview)
@@ -20,14 +26,10 @@ struct SetupView: View {
             HStack {
                 Button("Test & Save") { Task { await model.testAndSave() } }
                     .buttonStyle(.borderedProminent)
-                if model.persistedAccount != nil {
-                    Button("Refresh") { Task { await model.refresh() } }
-                    Button("Delete Account", role: .destructive) { Task { await model.deleteAccount() } }
-                }
+                    .disabled(model.isOperationInProgress)
             }
         }
-        .formStyle(.grouped)
-        .frame(width: 390)
         .padding()
+        .disabled(model.isOperationInProgress && model.operationState == .testing)
     }
 }

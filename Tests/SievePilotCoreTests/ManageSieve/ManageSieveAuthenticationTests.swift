@@ -107,6 +107,56 @@ import Testing
     }
 
 
+    @Test func postAuthCapabilityListingMayOmitSASLLikeDovecot() async throws {
+        let dovecot = "\"IMPLEMENTATION\" \"Dovecot Pigeonhole\"\r\n"
+            + "\"SIEVE\" \"fileinto\"\r\n"
+            + "\"MAXREDIRECTS\" \"4\"\r\n"
+            + "\"NOTIFY\" \"mailto\"\r\n"
+            + "\"VERSION\" \"1.0\"\r\n"
+            + "OK \"Capability completed.\"\r\n"
+        let (transport, client) = setup([
+            .write(plainCommand(username, password)), .read(Data("OK \"Logged in.\"\r\n".utf8)),
+            .write(Data("CAPABILITY\r\n".utf8)), .read(Data(dovecot.utf8)),
+            .write(Data("LISTSCRIPTS\r\n".utf8)), .read(Data("\"main\" ACTIVE\r\nOK\r\n".utf8)),
+        ])
+        _ = try await client.connectAndStartTLS(identity: identity)
+        try await client.authenticatePlain(username: username, password: password)
+        #expect(await client.state == .authenticated)
+        #expect(await client.capabilities?.isAuthoritative == true)
+        #expect(try await client.listScripts() == [ManageSieveScriptEntry(name: "main", isActive: true)])
+        #expect(await transport.assertComplete())
+    }
+
+    @Test func authenticatePlainAcceptsCapabilityListingOnTheAuthenticateOK() async throws {
+        let (transport, client) = setup([
+            .write(plainCommand(username, password)),
+            .read(Data(refreshed.utf8)),
+            .write(Data("LISTSCRIPTS\r\n".utf8)),
+            .read(Data("\"main\" ACTIVE\r\nOK\r\n".utf8)),
+        ])
+        _ = try await client.connectAndStartTLS(identity: identity)
+        try await client.authenticatePlain(username: username, password: password)
+        #expect(await client.state == .authenticated)
+        #expect(await client.capabilities?.implementation == Data("after".utf8))
+        #expect(try await client.listScripts() == [ManageSieveScriptEntry(name: "main", isActive: true)])
+        #expect(await transport.assertComplete())
+    }
+
+    @Test func dovecotPostAuthGreetingInSameReadIsConsumedWithoutCapabilityCommand() async throws {
+        let (transport, client) = setup([
+            .write(plainCommand(username, password)),
+            .read(Data(("OK \"Logged in.\"\r\n" + refreshed).utf8)),
+            .write(Data("LISTSCRIPTS\r\n".utf8)),
+            .read(Data("\"main\" ACTIVE\r\nOK\r\n".utf8)),
+        ])
+        _ = try await client.connectAndStartTLS(identity: identity)
+        try await client.authenticatePlain(username: username, password: password)
+        #expect(await client.state == .authenticated)
+        #expect(await client.capabilities?.implementation == Data("after".utf8))
+        #expect(try await client.listScripts() == [ManageSieveScriptEntry(name: "main", isActive: true)])
+        #expect(await transport.assertComplete())
+    }
+
     @Test func plainSuccessRequiresCapabilityReacquisition() async throws {
         let (transport, client) = setup([
             .write(plainCommand(username, password)), .read(Data("OK\r\n".utf8)),

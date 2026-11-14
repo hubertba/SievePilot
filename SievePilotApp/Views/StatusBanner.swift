@@ -8,6 +8,7 @@ struct StatusBanner: View {
         if let message {
             Label(message, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)
+                .textSelection(.enabled)
         } else {
             Label(title, systemImage: symbol)
                 .foregroundStyle(color)

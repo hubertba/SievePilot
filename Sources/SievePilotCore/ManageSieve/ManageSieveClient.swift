@@ -42,6 +42,9 @@ public actor ManageSieveClient {
     private var admittedOperation: ManageSieveOperationAdmission?
     public private(set) var capabilities: ManageSieveCapabilities?
     public private(set) var state: ManageSieveClientState = .disconnected
+    private var leftoverParser: ManageSieveResponseParser
+    private var leftoverLines: [ManageSieveWireLine] = []
+    private var inboundTrace = Data()
 
     public init(
         transport: any ManageSieveTransport,
@@ -55,6 +58,7 @@ public actor ManageSieveClient {
         self.timeoutPolicy = timeoutPolicy
         self.limits = limits
         self.logger = logger
+        leftoverParser = ManageSieveResponseParser(limits: limits)
     }
 
     public func connectAndStartTLS(
@@ -120,10 +124,7 @@ public actor ManageSieveClient {
                 command.append(contentsOf: [0x0d, 0x0a])
                 defer { ManageSieveAuthentication.wipe(&command) }
                 try await self.sendBytes(command)
-                let response = try await self.readResponse()
-                guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
-                try self.requireOK(response)
-                try await self.finishAuthentication()
+                try await self.completePlainAuthentication(try await self.readResponse())
             }
             admittedOperation = nil
         } catch let error as ManageSieveClientError where error == .serverNo && state == .encryptedReady {
@@ -148,22 +149,15 @@ public actor ManageSieveClient {
         do {
             try await withTimeout(timeout ?? timeoutPolicy.authentication) {
                 try await self.send("AUTHENTICATE \"LOGIN\"\r\n")
-                var parser = ManageSieveResponseParser(limits: self.limits)
-                var pending: [ManageSieveWireLine] = []
                 for value in [username, password] {
-                    let line = try await self.readAuthenticationLine(parser: &parser, pending: &pending)
-                    if case let .atom(word)? = line.tokens.first,
-                       ["OK", "NO", "BYE"].contains(word.uppercased()) {
-                        guard pending.isEmpty else { throw ManageSieveClientError.parse }
-                        do { try parser.finish() } catch { throw ManageSieveClientError.parse }
+                    let line = try await self.nextLine()
+                    if line.startsWithTerminalStatus, await self.hasUnconsumedInbound {
+                        throw ManageSieveClientError.parse
                     }
                     try self.requireChallenge(line)
-                    if pending.contains(where: { line in
-                        if case let .atom(word)? = line.tokens.first {
-                            return ["OK", "NO", "BYE"].contains(word.uppercased())
-                        }
-                        return false
-                    }) { throw ManageSieveClientError.parse }
+                    if await self.leftoverLines.contains(where: \.startsWithTerminalStatus) {
+                        throw ManageSieveClientError.parse
+                    }
                     var encoded = ManageSieveAuthentication.login(value)
                     defer { ManageSieveAuthentication.wipe(&encoded) }
                     var command = ManageSieveAuthentication.string(encoded)
@@ -171,13 +165,12 @@ public actor ManageSieveClient {
                     defer { ManageSieveAuthentication.wipe(&command) }
                     try await self.sendBytes(command)
                 }
-                let terminal = try await self.readAuthenticationLine(parser: &parser, pending: &pending)
-                guard pending.isEmpty else { throw ManageSieveClientError.parse }
-                do { try parser.finish() } catch { throw ManageSieveClientError.parse }
-                let status: ManageSieveStatusResponse
-                do { status = try ManageSieveStatusResponse(line: terminal) }
+                let terminal = try await self.nextLine()
+                guard terminal.startsWithTerminalStatus else { throw ManageSieveClientError.parse }
+                let response: ManageSieveCommandResponse
+                do { response = try ManageSieveCommandResponse(lines: [terminal]) }
                 catch { throw ManageSieveClientError.parse }
-                try self.requireStatus(status.status)
+                try self.requireOK(response)
                 try await self.finishAuthentication()
             }
             admittedOperation = nil
@@ -200,9 +193,29 @@ public actor ManageSieveClient {
         }
     }
 
+    private func completePlainAuthentication(_ response: ManageSieveCommandResponse) async throws {
+        if response.dataLines.isEmpty {
+            try requireOK(response)
+            try await finishAuthentication()
+            return
+        }
+        // Dovecot may attach the post-auth capability listing to AUTHENTICATE's OK.
+        let caps = try interpretCapabilities(response, origin: .postAuthentication)
+        try ensureOpen()
+        capabilities = caps
+        state = .authenticated
+        logger.record(.authenticated)
+    }
+
     private func finishAuthentication() async throws {
         do {
-            let replacement = try await refreshCapabilities()
+            // Dovecot (and RFC 5804 when a SASL layer is negotiated) may already have
+            // written the post-auth capability block after AUTHENTICATE's OK. Consume it
+            // if it is already buffered; otherwise ask. Sending CAPABILITY while that
+            // block is pending leaves the later reply for LISTSCRIPTS.
+            let replacement = hasUnconsumedInbound
+                ? try interpretCapabilities(try await readResponse(), origin: .postAuthentication)
+                : try await refreshCapabilities()
             try ensureOpen()
             capabilities = replacement
             state = .authenticated
@@ -211,23 +224,6 @@ public actor ManageSieveClient {
             await close()
             throw sanitized(error)
         }
-    }
-
-    private func readAuthenticationLine(
-        parser: inout ManageSieveResponseParser,
-        pending: inout [ManageSieveWireLine]
-    ) async throws -> ManageSieveWireLine {
-        while pending.isEmpty {
-            try ensureOpen()
-            let bytes: Data
-            do { bytes = try await transport.read(maxBytes: 4096) }
-            catch { throw ManageSieveClientError.transport }
-            try ensureOpen()
-            guard !bytes.isEmpty else { throw ManageSieveClientError.unexpectedEOF }
-            do { pending = try parser.feed(bytes) }
-            catch { throw ManageSieveClientError.parse }
-        }
-        return pending.removeFirst()
     }
 
     nonisolated private func requireChallenge(_ line: ManageSieveWireLine) throws {
@@ -419,11 +415,13 @@ public actor ManageSieveClient {
         guard state != .closed else { return }
         state = .closed
         capabilities = nil
+        resetInboundFraming()
         await transport.close()
         logger.record(.closed)
     }
 
     private func performHandshake(identity: ManageSieveTLSIdentityRequest) async throws -> ManageSieveCapabilities {
+        inboundTrace = Data()
         do { try await transport.connect() } catch { throw ManageSieveClientError.transport }
         try ensureOpen()
         logger.record(.connected)
@@ -439,6 +437,7 @@ public actor ManageSieveClient {
         let response = try await readResponse(maxBytes: 1)
         try requireOK(response)
         guard response.dataLines.isEmpty else { throw ManageSieveClientError.parse }
+        resetInboundFraming()
         do { try await transport.upgradeToTLS(identity: identity) } catch {
             switch error as? NIOTransportError {
             case .tlsTrustFailed: throw ManageSieveClientError.tlsTrustFailed
@@ -454,7 +453,7 @@ public actor ManageSieveClient {
         // without being asked. Consume that block here. Writing CAPABILITY first would queue a second
         // reply behind it and leave every later command reading the previous command's response. A
         // server that never re-issues is ended by the handshake deadline, never by a competing command.
-        let secure = try interpretCapabilities(try await readResponse())
+        let secure = try interpretCapabilities(try await readResponse(), origin: .postTLSCapability)
         try ensureOpen()
         capabilities = secure
         state = .encryptedReady
@@ -465,15 +464,18 @@ public actor ManageSieveClient {
     /// capability block of its own after authentication and the client must ask.
     private func refreshCapabilities() async throws -> ManageSieveCapabilities {
         try await send("CAPABILITY\r\n")
-        return try interpretCapabilities(try await readResponse())
+        return try interpretCapabilities(try await readResponse(), origin: .postAuthentication)
     }
 
-    private func interpretCapabilities(_ response: ManageSieveCommandResponse) throws -> ManageSieveCapabilities {
+    private func interpretCapabilities(
+        _ response: ManageSieveCommandResponse,
+        origin: ManageSieveCapabilityOrigin
+    ) throws -> ManageSieveCapabilities {
         guard response.status.status == .ok || response.dataLines.isEmpty else {
             throw ManageSieveClientError.parse
         }
         try requireOK(response)
-        return try interpret(response, origin: .postTLSCapability)
+        return try interpret(response, origin: origin)
     }
 
     private func send(_ command: String) async throws {
@@ -488,35 +490,52 @@ public actor ManageSieveClient {
         try ensureOpen()
     }
 
+    private var hasUnconsumedInbound: Bool {
+        !leftoverLines.isEmpty || leftoverParser.bufferedByteCount > 0
+    }
+
+    private func resetInboundFraming() {
+        leftoverParser = ManageSieveResponseParser(limits: limits)
+        leftoverLines = []
+    }
+
+    private func recordInbound(_ data: Data) {
+        inboundTrace.append(data)
+        if inboundTrace.count > 32 * 1024 {
+            inboundTrace.removeFirst(inboundTrace.count - 32 * 1024)
+        }
+    }
+
+    private func nextLine(maxBytes: Int = 4096) async throws -> ManageSieveWireLine {
+        if leftoverLines.isEmpty {
+            while leftoverLines.isEmpty {
+                try ensureOpen()
+                let bytes: Data
+                do { bytes = try await transport.read(maxBytes: maxBytes) } catch {
+                    throw ManageSieveClientError.transport
+                }
+                try ensureOpen()
+                guard !bytes.isEmpty else {
+                    do { try leftoverParser.finish() } catch { throw ManageSieveClientError.parse }
+                    throw ManageSieveClientError.unexpectedEOF
+                }
+                recordInbound(bytes)
+                do { leftoverLines.append(contentsOf: try leftoverParser.feed(bytes)) } catch {
+                    throw ManageSieveClientError.parse
+                }
+            }
+        }
+        return leftoverLines.removeFirst()
+    }
+
     private func readResponse(maxBytes: Int = 4096) async throws -> ManageSieveCommandResponse {
-        var parser = ManageSieveResponseParser(limits: limits)
         var lines: [ManageSieveWireLine] = []
         while true {
-            try ensureOpen()
-            let bytes: Data
-            do { bytes = try await transport.read(maxBytes: maxBytes) } catch {
-                throw ManageSieveClientError.transport
-            }
-            try ensureOpen()
-            guard !bytes.isEmpty else {
-                do { try parser.finish() } catch { throw ManageSieveClientError.parse }
-                throw ManageSieveClientError.unexpectedEOF
-            }
-            do { lines.append(contentsOf: try parser.feed(bytes)) } catch {
-                throw ManageSieveClientError.parse
-            }
-            if lines.contains(where: { line in
-                guard case let .atom(word)? = line.tokens.first else { return false }
-                return ["OK", "NO", "BYE"].contains(word.uppercased())
-            }) {
-                guard lines.last.map({ line in
-                    guard case let .atom(word)? = line.tokens.first else { return false }
-                    return ["OK", "NO", "BYE"].contains(word.uppercased())
-                }) == true else { throw ManageSieveClientError.parse }
-                do {
-                    try parser.finish()
-                    return try ManageSieveCommandResponse(lines: lines)
-                } catch { throw ManageSieveClientError.parse }
+            let line = try await nextLine(maxBytes: maxBytes)
+            lines.append(line)
+            if line.startsWithTerminalStatus {
+                do { return try ManageSieveCommandResponse(lines: lines) }
+                catch { throw ManageSieveClientError.parse }
             }
         }
     }
@@ -559,9 +578,29 @@ public actor ManageSieveClient {
     }
 
     private func sanitized(_ error: Error) -> ManageSieveClientError {
-        if let clientError = error as? ManageSieveClientError { return clientError }
-        if error is CancellationError { return .cancelled }
-        return .transport
+        let clientError: ManageSieveClientError
+        if let error = error as? ManageSieveClientError { clientError = error }
+        else if error is CancellationError { clientError = .cancelled }
+        else { clientError = .transport }
+        if clientError == .parse { Self.writeInboundDump(inboundTrace) }
+        return clientError
+    }
+
+    /// Debug aid: last inbound bytes that failed to parse. Server-to-client only (no AUTHENTICATE payload).
+    private static func writeInboundDump(_ data: Data) {
+        var escaped = ""
+        escaped.reserveCapacity(data.count * 2)
+        for byte in data {
+            switch byte {
+            case 0x0d: escaped.append("\\r")
+            case 0x0a: escaped.append("\\n\n")
+            case 0x09: escaped.append("\\t")
+            case 0x20...0x7e: escaped.append(Character(UnicodeScalar(byte)))
+            default: escaped.append(contentsOf: String(format: "\\x%02x", byte))
+            }
+        }
+        let body = "SievePilot last inbound from the server:\n\n\(escaped)\n"
+        try? body.write(to: URL(fileURLWithPath: "/tmp/sievepilot-last-response.txt"), atomically: true, encoding: .utf8)
     }
 
     private func checkAdmission() throws {

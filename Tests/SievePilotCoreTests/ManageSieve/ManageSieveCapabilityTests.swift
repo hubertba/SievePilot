@@ -184,6 +184,24 @@ import Testing
         }
     }
 
+    @Test func postAuthenticationOmitsSASLAndRemainsAuthoritative() throws {
+        let capabilities = try parseCapabilities([
+            strings("IMPLEMENTATION", "Dovecot Pigeonhole"),
+            strings("SIEVE", "fileinto"),
+            strings("MAXREDIRECTS", "4"),
+            strings("NOTIFY", "mailto"),
+            strings("VERSION", "1.0"),
+        ], origin: .postAuthentication)
+        #expect(capabilities.isAuthoritative)
+        #expect(!capabilities.containsCapability("SASL"))
+        #expect(throws: ManageSieveInterpretationError.missingAuthoritativeCapability("SIEVE")) {
+            try parseCapabilities([
+                strings("IMPLEMENTATION", "server"),
+                strings("VERSION", "1"),
+            ], origin: .postAuthentication)
+        }
+    }
+
     @Test func completePostTLSCapabilitiesAreAuthoritative() throws {
         let capabilities = try parseCapabilities([
             strings("IMPLEMENTATION", "server"),

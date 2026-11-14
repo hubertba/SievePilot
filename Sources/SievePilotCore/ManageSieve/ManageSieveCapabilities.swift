@@ -3,6 +3,8 @@ import Foundation
 public enum ManageSieveCapabilityOrigin: Equatable, Sendable {
     case preTLSGreeting
     case postTLSCapability
+    /// After AUTHENTICATE, SASL is often omitted (Dovecot). Still authoritative for Sieve extensions.
+    case postAuthentication
 }
 
 public struct ManageSieveCapability: Equatable, Sendable {
@@ -20,7 +22,7 @@ public struct ManageSieveCapabilities: Equatable, Sendable {
     public let entries: [ManageSieveCapability]
 
     public var isAuthoritative: Bool {
-        origin == .postTLSCapability
+        origin == .postTLSCapability || origin == .postAuthentication
     }
 
     public var implementation: Data? {
@@ -86,8 +88,11 @@ public struct ManageSieveCapabilities: Equatable, Sendable {
             entries.append(capability)
         }
 
-        if origin == .postTLSCapability {
-            for requiredName in Self.authoritativeCapabilityNames {
+        if origin == .postTLSCapability || origin == .postAuthentication {
+            let required = origin == .postAuthentication
+                ? Self.postAuthenticationCapabilityNames
+                : Self.authoritativeCapabilityNames
+            for requiredName in required {
                 guard entries.contains(where: {
                     Self.foldedASCII($0.name) == Data(requiredName.utf8)
                 }) else {
@@ -161,6 +166,12 @@ public struct ManageSieveCapabilities: Equatable, Sendable {
         "IMPLEMENTATION",
         "VERSION",
         "SASL",
+        "SIEVE",
+    ]
+
+    private static let postAuthenticationCapabilityNames = [
+        "IMPLEMENTATION",
+        "VERSION",
         "SIEVE",
     ]
 

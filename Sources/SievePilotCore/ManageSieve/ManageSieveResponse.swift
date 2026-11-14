@@ -101,7 +101,7 @@ private extension ManageSieveStatus {
     }
 }
 
-private extension ManageSieveWireLine {
+extension ManageSieveWireLine {
     var startsWithTerminalStatus: Bool {
         guard case let .atom(keyword)? = tokens.first else { return false }
         return ManageSieveStatus(keyword: keyword) != nil

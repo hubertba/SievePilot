@@ -28,12 +28,14 @@ struct PopoverContent: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.persistedAccount == nil {
-                SetupView(model: model)
-            } else if model.isShowingSettings {
-                AccountSettingsView(model: model)
-            } else {
-                OutOfOfficeView(model: model)
+            Group {
+                if model.persistedAccount == nil {
+                    SetupView(model: model)
+                } else if model.isShowingSettings {
+                    AccountSettingsView(model: model)
+                } else {
+                    OutOfOfficeView(model: model)
+                }
             }
             Divider()
             HStack {
@@ -44,5 +46,8 @@ struct PopoverContent: View {
             .padding(.horizontal)
             .padding(.vertical, 8)
         }
+        .frame(width: 390)
+        .fixedSize(horizontal: true, vertical: true)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
