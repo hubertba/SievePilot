@@ -10,8 +10,11 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
     var listCount = 0
     var conflictOnSecondList: (String, Data)?
     var setActiveError: Error?
+    var deleteError: Error?
     var putError: Error?
     var checkError: Error?
+    var listErrorAtCount: Int?
+    var listError: Error?
     var corruptReadBack = false
 
     init(capabilities: ManageSieveCapabilities, scripts: [String: Data] = [:], active: String? = nil) {
@@ -19,6 +22,7 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
     }
     func listScripts(timeout: Duration?) async throws -> [ManageSieveScriptEntry] {
         listCount += 1; events.append("list")
+        if listCount == listErrorAtCount, let listError { throw listError }
         if listCount == 2, let conflictOnSecondList {
             scripts[conflictOnSecondList.0] = conflictOnSecondList.1
             active = conflictOnSecondList.0
@@ -45,9 +49,14 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
     func setActive(name: String, timeout: Duration?) async throws {
         events.append("active:\(name)")
         if let setActiveError { throw setActiveError }
-        active = name
+        active = name.isEmpty ? nil : name
     }
-    func deleteScript(name: String, timeout: Duration?) async throws { events.append("delete:\(name)"); scripts[name] = nil }
+    func deleteScript(name: String, timeout: Duration?) async throws {
+        events.append("delete:\(name)")
+        if let deleteError { throw deleteError }
+        scripts[name] = nil
+        if active == name { active = nil }
+    }
 }
 
 private struct ServiceProvider: ManageSieveSessionProviding {
@@ -156,6 +165,7 @@ final class SieveAccountServiceTests: XCTestCase {
         let empty = ServiceSession(capabilities: try capabilities())
         let snapshot = try await service(empty).refresh(account: account())
         XCTAssertNil(snapshot.activeScriptName); XCTAssertNil(snapshot.activeScript)
+        XCTAssertEqual(snapshot.scripts, [])
         XCTAssertEqual(snapshot.outOfOfficeState, .off); XCTAssertEqual(snapshot.verifiedAt, now)
 
         let binary = Data([0xff, 0x00, 0xfe])
@@ -170,6 +180,173 @@ final class SieveAccountServiceTests: XCTestCase {
         let mismatch = ServiceSession(capabilities: try capabilities(), scripts: ["owned": owned], active: "owned")
         let mismatchSnapshot = try await service(mismatch).refresh(account: account())
         XCTAssertEqual(mismatchSnapshot.outOfOfficeState, .malformed(reason: "accountIDMismatch"))
+    }
+
+    func testRefreshListsEveryScriptAndMarksTheActiveOne() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["keep": Data("keep;\n".utf8), "vacation": Data("keep;\n".utf8)],
+                                     active: "vacation")
+        let snapshot = try await service(session).refresh(account: account())
+        XCTAssertEqual(Set(snapshot.scripts.map(\.name)), ["keep", "vacation"])
+        XCTAssertEqual(snapshot.scripts.first(where: \.isActive)?.name, "vacation")
+        XCTAssertEqual(snapshot.scripts.filter(\.isActive).count, 1)
+        XCTAssertEqual(snapshot.activeScriptName, "vacation")
+    }
+
+    func testGetScriptReturnsNamedScriptWithoutActivating() async throws {
+        let keep = Data("keep;\n".utf8)
+        let vacation = Data("require \"vacation\";\n".utf8)
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["keep": keep, "vacation": vacation],
+                                     active: "vacation")
+        let bytes = try await service(session).getScript(account: account(), name: "keep")
+        XCTAssertEqual(bytes, keep)
+        let events = await session.events
+        let active = await session.active
+        XCTAssertEqual(events, ["get:keep"])
+        XCTAssertEqual(active, "vacation")
+    }
+
+    func testDeleteInactiveScriptDeletesAndReturnsVerifiedSnapshot() async throws {
+        let activeBytes = Data("keep;\n".utf8)
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["active": activeBytes, "old": Data("discard;\n".utf8)],
+                                     active: "active")
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "old")
+
+        guard case .verified(let snapshot) = outcome else { return XCTFail("Expected verified deletion") }
+        XCTAssertEqual(snapshot.activeScriptName, "active")
+        XCTAssertEqual(snapshot.activeScript, activeBytes)
+        XCTAssertEqual(snapshot.scripts, [ManageSieveScriptEntry(name: "active", isActive: true)])
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "delete:old", "list", "get:active"])
+    }
+
+    func testDeleteActiveScriptDeactivatesThenDeletesAndReturnsVerifiedOffSnapshot() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["active": Data("keep;\n".utf8)], active: "active")
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "active")
+
+        guard case .verified(let snapshot) = outcome else { return XCTFail("Expected verified deletion") }
+        XCTAssertNil(snapshot.activeScriptName)
+        XCTAssertNil(snapshot.activeScript)
+        XCTAssertTrue(snapshot.scripts.isEmpty)
+        XCTAssertEqual(snapshot.outOfOfficeState, VerifiedOutOfOfficeState.off)
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "active:", "delete:active", "list"])
+    }
+
+    func testDeleteUsesFreshActiveStateRatherThanCallerSnapshot() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["target": Data("keep;\n".utf8)], active: nil)
+        await session.setActiveValue("target")
+
+        _ = try await service(session).deleteScript(account: account(), name: "target")
+
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "active:", "delete:target", "list"])
+    }
+
+    func testDeleteAlreadyAbsentScriptReturnsVerifiedSnapshotWithoutMutation() async throws {
+        let activeBytes = Data("keep;\n".utf8)
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["active": activeBytes], active: "active")
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "missing")
+
+        guard case .verified(let snapshot) = outcome else { return XCTFail("Expected verified absence") }
+        XCTAssertEqual(snapshot.activeScriptName, "active")
+        XCTAssertEqual(snapshot.activeScript, activeBytes)
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "get:active"])
+    }
+
+    func testDeletePreservesAndReadsBackDifferentRemainingActiveScript() async throws {
+        let metadata = try ManagedScriptMetadata(accountID: accountID, versionID: UUID(), predecessorSHA256: nil)
+        let managed = try SieveScriptPatcher.apply(.enable(configuration()), to: Data(),
+                                                   metadata: metadata, accountID: accountID)
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["old": Data("discard;\n".utf8), "remaining": managed],
+                                     active: "remaining")
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "old")
+
+        guard case .verified(let snapshot) = outcome else { return XCTFail("Expected verified deletion") }
+        XCTAssertEqual(snapshot.activeScriptName, "remaining")
+        XCTAssertEqual(snapshot.activeScript, managed)
+        guard case .on = snapshot.outOfOfficeState else { return XCTFail("Expected remaining managed script state") }
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "delete:old", "list", "get:remaining"])
+    }
+
+    func testDeleteReturnsUnknownWhenDeactivationOutcomeIsAmbiguous() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["active": Data("keep;\n".utf8)], active: "active")
+        await session.setSetActiveError(ManageSieveClientError.transport)
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "active")
+
+        XCTAssertEqual(outcome, .unknown)
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "active:"])
+    }
+
+    func testDeleteReturnsUnknownWhenDeletionOutcomeIsAmbiguousAfterDeactivation() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["active": Data("keep;\n".utf8)], active: "active")
+        await session.setDeleteError(ManageSieveClientError.transport)
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "active")
+
+        XCTAssertEqual(outcome, .unknown)
+        let active = await session.active
+        XCTAssertNil(active)
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "active:", "delete:active"])
+    }
+
+    func testDeleteReturnsUnknownWhenPostDeleteVerificationFails() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["old": Data("keep;\n".utf8)], active: nil)
+        await session.setListError(at: 2, error: ManageSieveClientError.transport)
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "old")
+
+        XCTAssertEqual(outcome, .unknown)
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "delete:old", "list"])
+    }
+
+    func testDeleteThrowsSpecificErrorWhenDeactivationIsRejected() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["active": Data("keep;\n".utf8)], active: "active")
+        await session.setSetActiveError(ManageSieveClientError.serverNo)
+
+        do {
+            _ = try await service(session).deleteScript(account: account(), name: "active")
+            XCTFail("Expected deactivation rejection")
+        } catch {
+            XCTAssertEqual(error as? SieveAccountServiceError, .scriptDeactivationRejected)
+        }
+        let active = await session.active
+        XCTAssertEqual(active, "active")
+    }
+
+    func testDeleteThrowsSpecificErrorWhenDeletionIsRejectedAfterDeactivation() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["active": Data("keep;\n".utf8)], active: "active")
+        await session.setDeleteError(ManageSieveClientError.serverNo)
+
+        do {
+            _ = try await service(session).deleteScript(account: account(), name: "active")
+            XCTFail("Expected deletion rejection")
+        } catch {
+            XCTAssertEqual(error as? SieveAccountServiceError, .scriptDeletionRejected(deactivated: true))
+        }
+        let active = await session.active
+        XCTAssertNil(active)
     }
 
     func testRefreshVerifiesOnExpiredAndMalformedManagedScripts() async throws {
@@ -354,6 +531,9 @@ final class SieveAccountServiceTests: XCTestCase {
 private extension ServiceSession {
     func setConflictOnSecondList(name: String, script: Data) { conflictOnSecondList = (name, script) }
     func setSetActiveError(_ error: Error?) { setActiveError = error }
+    func setDeleteError(_ error: Error?) { deleteError = error }
+    func setListError(at count: Int?, error: Error?) { listErrorAtCount = count; listError = error }
+    func setActiveValue(_ name: String?) { active = name }
     func setPutError(_ error: Error?) { putError = error }
     func setCheckError(_ error: Error?) { checkError = error }
     func setCorruptReadBack(_ value: Bool) { corruptReadBack = value }

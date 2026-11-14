@@ -5,14 +5,18 @@ import Security
 public struct VerifiedAccountSnapshot: Equatable, Sendable {
     public let activeScriptName: String?
     public let activeScript: Data?
+    public let scripts: [ManageSieveScriptEntry]
     public let outOfOfficeState: VerifiedOutOfOfficeState
     public let verifiedAt: Date
     public let capabilities: ManageSieveCapabilities
 
-    public init(activeScriptName: String?, activeScript: Data?, outOfOfficeState: VerifiedOutOfOfficeState,
+    public init(activeScriptName: String?, activeScript: Data?,
+                scripts: [ManageSieveScriptEntry] = [],
+                outOfOfficeState: VerifiedOutOfOfficeState,
                 verifiedAt: Date, capabilities: ManageSieveCapabilities) {
         self.activeScriptName = activeScriptName
         self.activeScript = activeScript
+        self.scripts = scripts
         self.outOfOfficeState = outOfOfficeState
         self.verifiedAt = verifiedAt
         self.capabilities = capabilities
@@ -22,6 +26,11 @@ public struct VerifiedAccountSnapshot: Equatable, Sendable {
 public enum AccountMutationOutcome: Equatable, Sendable {
     case verified(VerifiedAccountSnapshot)
     case conflict
+    case unknown
+}
+
+public enum ScriptDeletionOutcome: Equatable, Sendable {
+    case verified(VerifiedAccountSnapshot)
     case unknown
 }
 
@@ -37,6 +46,11 @@ public enum SieveAccountServiceError: Error, Equatable, Sendable {
     case quotaExceeded
     /// `SETACTIVE` answered `NO`: a definite refusal, so this operation did not change the active script.
     case activationRejected
+    /// Deactivating the selected active script was definitely refused, so deletion was not attempted.
+    case scriptDeactivationRejected
+    /// `DELETESCRIPT` was definitely refused. `deactivated` says whether this operation had already
+    /// deactivated the selected script, leaving it stored but inactive.
+    case scriptDeletionRejected(deactivated: Bool)
 }
 
 public actor SieveAccountService {
@@ -67,15 +81,54 @@ public actor SieveAccountService {
         return try await sessionProvider.withAuthenticatedSession(account: account) { session in
             let capabilities = await session.capabilities
             try Self.requireCapabilities(capabilities)
+            return try await Self.verifiedSnapshot(session: session, capabilities: capabilities,
+                                                   accountID: account.accountID, now: now())
+        }
+    }
+
+    /// Fetches one named script with `GETSCRIPT`. Does not activate it or rewrite it.
+    public func getScript(account: AccountConfiguration, name: String) async throws -> Data {
+        try await sessionProvider.withAuthenticatedSession(account: account) { session in
+            try await session.getScript(name: name, timeout: nil)
+        }
+    }
+
+    public func deleteScript(account: AccountConfiguration, name: String) async throws -> ScriptDeletionOutcome {
+        let now = self.now
+        return try await sessionProvider.withAuthenticatedSession(account: account) { session in
+            let capabilities = await session.capabilities
+            try Self.requireCapabilities(capabilities)
             let entries = try await session.listScripts(timeout: nil)
-            let activeName = entries.first(where: \.isActive)?.name
-            let activeScript: Data?
-            if let activeName { activeScript = try await session.getScript(name: activeName, timeout: nil) }
-            else { activeScript = nil }
-            let verifiedAt = now()
-            let state = Self.verifiedState(script: activeScript, accountID: account.accountID, now: verifiedAt)
-            return VerifiedAccountSnapshot(activeScriptName: activeName, activeScript: activeScript,
-                                           outOfOfficeState: state, verifiedAt: verifiedAt, capabilities: capabilities)
+            guard let target = entries.first(where: { $0.name == name }) else {
+                return try await .verified(Self.verifiedSnapshot(session: session, entries: entries,
+                    capabilities: capabilities, accountID: account.accountID, now: now()))
+            }
+
+            let wasDeactivated = target.isActive
+            if wasDeactivated {
+                do { try await session.setActive(name: "", timeout: nil) }
+                catch {
+                    if Self.isAmbiguous(error) { return .unknown }
+                    if Self.isDefiniteRejection(error) { throw SieveAccountServiceError.scriptDeactivationRejected }
+                    throw error
+                }
+            }
+
+            do { try await session.deleteScript(name: name, timeout: nil) }
+            catch {
+                if Self.isAmbiguous(error) { return .unknown }
+                if Self.isDefiniteRejection(error) {
+                    throw SieveAccountServiceError.scriptDeletionRejected(deactivated: wasDeactivated)
+                }
+                throw error
+            }
+
+            do {
+                return try await .verified(Self.verifiedSnapshot(session: session, capabilities: capabilities,
+                    accountID: account.accountID, now: now()))
+            } catch {
+                return .unknown
+            }
         }
     }
 
@@ -143,6 +196,7 @@ public actor SieveAccountService {
                 catch { return .unknown }
                 let verifiedAt = now()
                 let snapshot = VerifiedAccountSnapshot(activeScriptName: name, activeScript: readBack,
+                    scripts: verifiedEntries,
                     outOfOfficeState: Self.verifiedState(script: readBack, accountID: account.accountID, now: verifiedAt),
                     verifiedAt: verifiedAt, capabilities: capabilities)
                 return .verified(snapshot)
@@ -150,6 +204,33 @@ public actor SieveAccountService {
                 return .unknown
             }
         }
+    }
+
+    private static func verifiedSnapshot(
+        session: any AuthenticatedManageSieveSession,
+        capabilities: ManageSieveCapabilities,
+        accountID: AccountID,
+        now: Date
+    ) async throws -> VerifiedAccountSnapshot {
+        let entries = try await session.listScripts(timeout: nil)
+        return try await verifiedSnapshot(session: session, entries: entries, capabilities: capabilities,
+                                          accountID: accountID, now: now)
+    }
+
+    private static func verifiedSnapshot(
+        session: any AuthenticatedManageSieveSession,
+        entries: [ManageSieveScriptEntry],
+        capabilities: ManageSieveCapabilities,
+        accountID: AccountID,
+        now: Date
+    ) async throws -> VerifiedAccountSnapshot {
+        let activeName = entries.first(where: \.isActive)?.name
+        let activeScript: Data?
+        if let activeName { activeScript = try await session.getScript(name: activeName, timeout: nil) }
+        else { activeScript = nil }
+        let state = verifiedState(script: activeScript, accountID: accountID, now: now)
+        return VerifiedAccountSnapshot(activeScriptName: activeName, activeScript: activeScript, scripts: entries,
+            outOfOfficeState: state, verifiedAt: now, capabilities: capabilities)
     }
 
     private static func uniqueName(accountID: AccountID, existing: Set<String>,
