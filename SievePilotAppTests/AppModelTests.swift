@@ -112,6 +112,7 @@ actor AppService: SieveAccountServicing {
     var getScriptError: Error?
     var deletionOutcomes: [Result<ScriptDeletionOutcome, Error>] = []
     var deletedScriptNames: [String] = []
+    var deletionAuthorizations: [Bool] = []
     var deletionGate: Gate?
     func refresh(account: AccountConfiguration) async throws -> VerifiedAccountSnapshot {
         refreshCount += 1
@@ -130,8 +131,10 @@ actor AppService: SieveAccountServicing {
         guard let data = scriptsByName[name] else { throw NSError(domain: "missing-script", code: 1) }
         return data
     }
-    func deleteScript(account: AccountConfiguration, name: String) async throws -> ScriptDeletionOutcome {
+    func deleteScript(account: AccountConfiguration, name: String,
+                      deactivateIfActive: Bool) async throws -> ScriptDeletionOutcome {
         deletedScriptNames.append(name)
+        deletionAuthorizations.append(deactivateIfActive)
         await deletionGate?.wait()
         guard !deletionOutcomes.isEmpty else { return .unknown }
         return try deletionOutcomes.removeFirst().get()
@@ -152,6 +155,7 @@ actor AppService: SieveAccountServicing {
     func setGetScriptError(_ error: Error?) { getScriptError = error }
     func enqueueDeletion(_ outcome: Result<ScriptDeletionOutcome, Error>) { deletionOutcomes.append(outcome) }
     func deletionNames() -> [String] { deletedScriptNames }
+    func deletionAuthorizationValues() -> [Bool] { deletionAuthorizations }
     func setDeletionGate(_ value: Gate?) { deletionGate = value }
 }
 

@@ -34,7 +34,10 @@ struct OutOfOfficeView: View {
                     ? "This script is active. SievePilot will deactivate it first, leaving no active Sieve script or mail rules, and then permanently delete it."
                     : "This will permanently delete the script from the server. This action cannot be undone."),
                 primaryButton: .destructive(Text(deletion.wasActive ? "Deactivate and Delete" : "Delete Script")) {
-                    Task { await model.deleteScript(named: deletion.name) }
+                    Task {
+                        await model.deleteScript(named: deletion.name,
+                                                 deactivationAuthorized: deletion.wasActive)
+                    }
                 },
                 secondaryButton: .cancel()
             )

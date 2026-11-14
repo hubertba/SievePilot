@@ -376,12 +376,13 @@ final class AppModel: ObservableObject {
         persistedAccount != nil && selectedScriptEntry != nil && activeOperation == nil
     }
 
-    func deleteScript(named name: String) async {
+    func deleteScript(named name: String, deactivationAuthorized: Bool) async {
         guard let account = persistedAccount, activeOperation == nil,
               listedScripts.contains(where: { $0.name == name }) else { return }
         await run(.deleteScript) { [self] token in
             do {
-                let outcome = try await accountService.deleteScript(account: account, name: name)
+                let outcome = try await accountService.deleteScript(account: account, name: name,
+                                                                    deactivateIfActive: deactivationAuthorized)
                 guard isCurrent(token) else { return }
                 switch outcome {
                 case .verified(let snapshot):
@@ -390,6 +391,10 @@ final class AppModel: ObservableObject {
                     userFacingError = nil
                     operationState = invalidatedDuringCritical ? .stale : .verified
                     await loadSelectedScriptIfNeeded()
+                case .activeConfirmationRequired(let snapshot):
+                    adopt(snapshot)
+                    userFacingError = "The script is now active. Review the active-script warning and confirm deletion again."
+                    operationState = invalidatedDuringCritical ? .stale : .verified
                 case .unknown:
                     userFacingError = "SievePilot could not verify whether the script was deleted. Refresh to check the server before trying again."
                     operationState = .unknown

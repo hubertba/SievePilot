@@ -31,6 +31,7 @@ public enum AccountMutationOutcome: Equatable, Sendable {
 
 public enum ScriptDeletionOutcome: Equatable, Sendable {
     case verified(VerifiedAccountSnapshot)
+    case activeConfirmationRequired(VerifiedAccountSnapshot)
     case unknown
 }
 
@@ -93,7 +94,8 @@ public actor SieveAccountService {
         }
     }
 
-    public func deleteScript(account: AccountConfiguration, name: String) async throws -> ScriptDeletionOutcome {
+    public func deleteScript(account: AccountConfiguration, name: String,
+                             deactivateIfActive: Bool = true) async throws -> ScriptDeletionOutcome {
         let now = self.now
         return try await sessionProvider.withAuthenticatedSession(account: account) { session in
             let capabilities = await session.capabilities
@@ -105,6 +107,10 @@ public actor SieveAccountService {
             }
 
             let wasDeactivated = target.isActive
+            if wasDeactivated && !deactivateIfActive {
+                return try await .activeConfirmationRequired(Self.verifiedSnapshot(session: session, entries: entries,
+                    capabilities: capabilities, accountID: account.accountID, now: now()))
+            }
             if wasDeactivated {
                 do { try await session.setActive(name: "", timeout: nil) }
                 catch {
@@ -124,8 +130,10 @@ public actor SieveAccountService {
             }
 
             do {
-                return try await .verified(Self.verifiedSnapshot(session: session, capabilities: capabilities,
-                    accountID: account.accountID, now: now()))
+                let verifiedEntries = try await session.listScripts(timeout: nil)
+                guard !verifiedEntries.contains(where: { $0.name == name }) else { return .unknown }
+                return try await .verified(Self.verifiedSnapshot(session: session, entries: verifiedEntries,
+                    capabilities: capabilities, accountID: account.accountID, now: now()))
             } catch {
                 return .unknown
             }

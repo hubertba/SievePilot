@@ -50,7 +50,7 @@ Connection, validation, conflict, and activation errors stay visible until you a
 
 The menu lists the Sieve scripts stored on the server. Select a script to inspect its status, SievePilot configuration, and source, then choose **Delete Script** to permanently remove it after confirmation.
 
-Deleting the active script first deactivates it, leaving the account with no active Sieve script or mail rules, and then deletes it. There is no undo or automatic replacement activation. If the connection is interrupted during deletion, SievePilot reports the outcome as unknown; choose **Refresh** before taking another action.
+Deleting the active script first deactivates it, leaving the account with no active Sieve script or mail rules, and then deletes it. If a script becomes active after an inactive-script confirmation, SievePilot does not deactivate it; it refreshes the displayed state and requires a second confirmation with the active-script warning. There is no undo or automatic replacement activation. If the connection is interrupted during deletion, SievePilot reports the outcome as unknown; choose **Refresh** before taking another action.
 
 ### Supported servers and capabilities
 

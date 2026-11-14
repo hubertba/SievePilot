@@ -15,6 +15,7 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
     var checkError: Error?
     var listErrorAtCount: Int?
     var listError: Error?
+    var retainDeletedScript = false
     var corruptReadBack = false
 
     init(capabilities: ManageSieveCapabilities, scripts: [String: Data] = [:], active: String? = nil) {
@@ -54,8 +55,10 @@ private actor ServiceSession: AuthenticatedManageSieveSession {
     func deleteScript(name: String, timeout: Duration?) async throws {
         events.append("delete:\(name)")
         if let deleteError { throw deleteError }
-        scripts[name] = nil
-        if active == name { active = nil }
+        if !retainDeletedScript {
+            scripts[name] = nil
+            if active == name { active = nil }
+        }
     }
 }
 
@@ -279,6 +282,36 @@ final class SieveAccountServiceTests: XCTestCase {
         guard case .on = snapshot.outOfOfficeState else { return XCTFail("Expected remaining managed script state") }
         let events = await session.events
         XCTAssertEqual(events, ["list", "delete:old", "list", "get:remaining"])
+    }
+
+    func testDeleteRequiresFreshActiveConfirmationBeforeDeactivation() async throws {
+        let bytes = Data("keep;\n".utf8)
+        let session = ServiceSession(capabilities: try capabilities(), scripts: ["target": bytes], active: "target")
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "target",
+                                                               deactivateIfActive: false)
+
+        guard case .activeConfirmationRequired(let snapshot) = outcome else {
+            return XCTFail("Expected active confirmation requirement")
+        }
+        XCTAssertEqual(snapshot.activeScriptName, "target")
+        XCTAssertEqual(snapshot.activeScript, bytes)
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "get:target"])
+        let active = await session.active
+        XCTAssertEqual(active, "target")
+    }
+
+    func testDeleteReturnsUnknownWhenTargetRemainsAfterSuccessfulDeleteCommand() async throws {
+        let session = ServiceSession(capabilities: try capabilities(),
+                                     scripts: ["old": Data("keep;\n".utf8)], active: nil)
+        await session.setRetainDeletedScript(true)
+
+        let outcome = try await service(session).deleteScript(account: account(), name: "old")
+
+        XCTAssertEqual(outcome, .unknown)
+        let events = await session.events
+        XCTAssertEqual(events, ["list", "delete:old", "list"])
     }
 
     func testDeleteReturnsUnknownWhenDeactivationOutcomeIsAmbiguous() async throws {
@@ -533,6 +566,7 @@ private extension ServiceSession {
     func setSetActiveError(_ error: Error?) { setActiveError = error }
     func setDeleteError(_ error: Error?) { deleteError = error }
     func setListError(at count: Int?, error: Error?) { listErrorAtCount = count; listError = error }
+    func setRetainDeletedScript(_ value: Bool) { retainDeletedScript = value }
     func setActiveValue(_ name: String?) { active = name }
     func setPutError(_ error: Error?) { putError = error }
     func setCheckError(_ error: Error?) { checkError = error }

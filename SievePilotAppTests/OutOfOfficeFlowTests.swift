@@ -212,7 +212,7 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.service.enqueueDeletion(.success(.verified(snapshot(.off,
             scripts: [.init(name: "active", isActive: true)], activeScript: activeBytes))))
 
-        await h.model.deleteScript(named: "old")
+        await h.model.deleteScript(named: "old", deactivationAuthorized: false)
 
         let deletionNames = await h.service.deletionNames()
         XCTAssertEqual(deletionNames, ["old"])
@@ -230,7 +230,7 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.model.refresh()
         await h.service.enqueueDeletion(.success(.verified(snapshot(.off))))
 
-        await h.model.deleteScript(named: "active")
+        await h.model.deleteScript(named: "active", deactivationAuthorized: true)
 
         XCTAssertTrue(h.model.listedScripts.isEmpty)
         XCTAssertNil(h.model.selectedScriptName)
@@ -244,7 +244,7 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.model.refresh()
         await h.service.enqueueDeletion(.success(.unknown))
 
-        await h.model.deleteScript(named: "old")
+        await h.model.deleteScript(named: "old", deactivationAuthorized: false)
 
         XCTAssertEqual(h.model.operationState, .unknown)
         XCTAssertEqual(h.model.userFacingError,
@@ -266,10 +266,28 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.service.enqueueDeletion(.success(.verified(snapshot(.off,
             scripts: [.init(name: "active", isActive: true)], activeScript: Data("keep;\n".utf8)))))
 
-        await h.model.deleteScript(named: "old")
+        await h.model.deleteScript(named: "old", deactivationAuthorized: false)
 
         let deletionNames = await h.service.deletionNames()
         XCTAssertEqual(deletionNames, ["old"])
+    }
+
+    func testDeleteRequiresSecondConfirmationWhenFreshServerStateBecameActive() async throws {
+        let h = try await harness()
+        await h.service.enqueue(snapshot(.off, scripts: [.init(name: "target", isActive: false)]))
+        await h.model.refresh()
+        let activeSnapshot = snapshot(.off, scripts: [.init(name: "target", isActive: true)],
+                                      activeScript: Data("keep;\n".utf8))
+        await h.service.enqueueDeletion(.success(.activeConfirmationRequired(activeSnapshot)))
+
+        await h.model.deleteScript(named: "target", deactivationAuthorized: false)
+
+        let authorizations = await h.service.deletionAuthorizationValues()
+        XCTAssertEqual(authorizations, [false])
+        XCTAssertEqual(h.model.selectedScriptEntry, .init(name: "target", isActive: true))
+        XCTAssertEqual(h.model.operationState, .verified)
+        XCTAssertEqual(h.model.userFacingError,
+                       "The script is now active. Review the active-script warning and confirm deletion again.")
     }
 
     func testDeleteScriptDisablesAnotherDeleteWhileInFlight() async throws {
@@ -280,12 +298,16 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.service.setDeletionGate(gate)
         await h.service.enqueueDeletion(.success(.verified(snapshot(.off))))
 
-        let first = Task { @MainActor in await h.model.deleteScript(named: "old") }
+        let first = Task { @MainActor in
+            await h.model.deleteScript(named: "old", deactivationAuthorized: false)
+        }
         await eventually { await h.service.deletionNames().count == 1 }
         XCTAssertTrue(h.model.isOperationInProgress)
         XCTAssertFalse(h.model.canDeleteSelectedScript)
 
-        let second = Task { @MainActor in await h.model.deleteScript(named: "old") }
+        let second = Task { @MainActor in
+            await h.model.deleteScript(named: "old", deactivationAuthorized: false)
+        }
         try? await Task.sleep(nanoseconds: 30_000_000)
         let namesWhileBlocked = await h.service.deletionNames()
         XCTAssertEqual(namesWhileBlocked, ["old"])
@@ -303,7 +325,9 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.service.setDeletionGate(gate)
         await h.service.enqueueDeletion(.success(.verified(snapshot(.off))))
 
-        let deletion = Task { @MainActor in await h.model.deleteScript(named: "old") }
+        let deletion = Task { @MainActor in
+            await h.model.deleteScript(named: "old", deactivationAuthorized: false)
+        }
         await eventually { await h.service.deletionNames().count == 1 }
         await h.model.handle(.networkLost)
         await gate.open()
@@ -321,7 +345,7 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.model.refresh()
         await h.service.enqueueDeletion(.failure(SieveAccountServiceError.scriptDeletionRejected(deactivated: true)))
 
-        await h.model.deleteScript(named: "active")
+        await h.model.deleteScript(named: "active", deactivationAuthorized: true)
 
         XCTAssertEqual(h.model.userFacingError,
                        "The script was deactivated but the server refused to delete it. It remains stored and inactive, and no Sieve script is active. Refresh to verify the server state.")
@@ -335,7 +359,7 @@ final class OutOfOfficeFlowTests: XCTestCase {
         await h.model.refresh()
         await h.service.enqueueDeletion(.failure(SieveAccountServiceError.scriptDeactivationRejected))
 
-        await h.model.deleteScript(named: "active")
+        await h.model.deleteScript(named: "active", deactivationAuthorized: true)
 
         XCTAssertEqual(h.model.userFacingError,
                        "The server refused to deactivate the active script, so it was not deleted. Refresh to verify the server state.")
