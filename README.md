@@ -46,6 +46,12 @@ The displayed state always comes from a verified read of the server, never from 
 
 Connection, validation, conflict, and activation errors stay visible until you acknowledge them or a later refresh resolves them.
 
+### Server scripts
+
+The menu lists the Sieve scripts stored on the server. Select a script to inspect its status, SievePilot configuration, and source, then choose **Delete Script** to permanently remove it after confirmation.
+
+Deleting the active script first deactivates it, leaving the account with no active Sieve script or mail rules, and then deletes it. There is no undo or automatic replacement activation. If the connection is interrupted during deletion, SievePilot reports the outcome as unknown; choose **Refresh** before taking another action.
+
 ### Supported servers and capabilities
 
 SievePilot requires an authoritative post-TLS ManageSieve capability list that includes the Sieve extensions `vacation`, `date`, and `relational`.
@@ -58,7 +64,7 @@ SievePilot requires an authoritative post-TLS ManageSieve capability list that i
 
 SievePilot never edits your script in place. It treats the active script as raw bytes, changes only the clearly marked sections it owns, uploads the result as a new, randomly named script version, activates that version, and reads it back to confirm it is byte-identical. Your own rules are preserved. If the active script changed after SievePilot read it, the update is reported as a conflict and is not activated.
 
-Every earlier version stays on the server as a rollback copy. SievePilot does not currently prune old versions or offer a restore command, so you can switch back with your mail provider's Sieve tools. ManageSieve has no atomic compare-and-set, so a narrow race remains if another client activates a script at the same moment; avoid editing the same account from several clients at once. Keep independent backups of important Sieve scripts.
+Every earlier version stays on the server as a rollback copy until you explicitly delete it. SievePilot does not automatically prune old versions or offer a restore command, so use your mail provider's Sieve tools to switch versions when needed. Script deletion is permanent and has no undo. ManageSieve has no atomic compare-and-set, so a narrow race remains if another client activates a script at the same moment; avoid editing the same account from several clients at once. Keep independent backups of important Sieve scripts.
 
 ## Development
 

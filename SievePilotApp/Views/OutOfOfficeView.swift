@@ -1,14 +1,24 @@
+import SievePilotCore
 import SwiftUI
 
 /// Compact operational popover. It renders model state only and never infers success from a request.
 struct OutOfOfficeView: View {
+    private struct ScriptDeletionConfirmation: Identifiable {
+        let name: String
+        let wasActive: Bool
+        var id: String { name }
+    }
+
     @ObservedObject var model: AppModel
+    @State private var pendingScriptDeletion: ScriptDeletionConfirmation?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
             Divider()
             statusRow
+            scriptList
+            selectedScriptDetail
             if let error = model.userFacingError { errorBanner(error) }
             if !model.capabilityLimitations.isEmpty { limitations }
             form
@@ -16,8 +26,19 @@ struct OutOfOfficeView: View {
             footer
         }
         .padding()
-        .frame(width: 390)
         .task { await model.popoverDidOpen() }
+        .alert(item: $pendingScriptDeletion) { deletion in
+            Alert(
+                title: Text("Delete “\(deletion.name)”?"),
+                message: Text(deletion.wasActive
+                    ? "This script is active. SievePilot will deactivate it first, leaving no active Sieve script or mail rules, and then permanently delete it."
+                    : "This will permanently delete the script from the server. This action cannot be undone."),
+                primaryButton: .destructive(Text(deletion.wasActive ? "Deactivate and Delete" : "Delete Script")) {
+                    Task { await model.deleteScript(named: deletion.name) }
+                },
+                secondaryButton: .cancel()
+            )
+        }
     }
 
     private var header: some View {
@@ -62,6 +83,161 @@ struct OutOfOfficeView: View {
             Button("Acknowledge") { model.acknowledgeError() }
         }
         .font(.callout)
+    }
+
+    private var scriptList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Scripts on server").font(.headline)
+            if model.listedScripts.isEmpty {
+                Text(model.verifiedSnapshot == nil
+                     ? "Refresh to load scripts from the server."
+                     : "No scripts on this server.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(model.listedScripts, id: \.name) { script in
+                            scriptRow(script)
+                        }
+                    }
+                }
+                .frame(maxHeight: 120)
+            }
+        }
+    }
+
+    private func scriptRow(_ script: ManageSieveScriptEntry) -> some View {
+        let isSelected = script.name == model.selectedScriptName
+        return Button {
+            Task { await model.selectScript(script.name) }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: script.isActive ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(script.isActive ? Color.green : Color.secondary)
+                Text(script.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.primary)
+                Spacer()
+                if script.isActive {
+                    Text("Active").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .font(.callout)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var selectedScriptDetail: some View {
+        if model.selectedScriptName != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Selected script").font(.headline)
+                selectedScriptConfiguration
+                selectedScriptContent
+                HStack {
+                    Spacer()
+                    Button("Delete Script", role: .destructive) {
+                        guard let script = model.selectedScriptEntry else { return }
+                        pendingScriptDeletion = ScriptDeletionConfirmation(name: script.name,
+                                                                           wasActive: script.isActive)
+                    }
+                    .disabled(!model.canDeleteSelectedScript)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var selectedScriptConfiguration: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Configuration").font(.callout).foregroundStyle(.secondary)
+            if let entry = model.selectedScriptEntry {
+                labeled("Name", entry.name)
+                labeled("Status", entry.isActive ? "Active" : "Inactive")
+            }
+            if model.isLoadingSelectedScript {
+                Text("Loading…").font(.callout).foregroundStyle(.secondary)
+            } else if model.scriptInspectError != nil {
+                Text("Unable to load this script.").font(.callout).foregroundStyle(.red)
+            } else {
+                switch model.selectedScriptOutOfOfficeState {
+                case .on(let configuration):
+                    managedConfiguration(configuration, expired: false)
+                case .expiryPassedServerClockApplies(let configuration):
+                    managedConfiguration(configuration, expired: true)
+                case .malformed:
+                    Text("This script has SievePilot markers that could not be parsed.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                case .off:
+                    Text("No SievePilot out-of-office configuration in this script.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                case .none:
+                    EmptyView()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func managedConfiguration(_ configuration: ParsedOutOfOfficeConfiguration, expired: Bool) -> some View {
+        labeled("Vacation", expired ? "Expiry passed — server clock applies" : "SievePilot out of office")
+        labeled("Address", configuration.emailAddress)
+        if let subject = configuration.subject, !subject.isEmpty {
+            labeled("Subject", subject)
+        }
+        labeled("Message", configuration.message)
+        labeled("Expiry", configuration.expiryInstant.formatted(date: .abbreviated, time: .shortened))
+    }
+
+    private func labeled(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title).foregroundStyle(.secondary).frame(width: 72, alignment: .leading)
+            Text(value).textSelection(.enabled)
+        }
+        .font(.callout)
+    }
+
+    @ViewBuilder
+    private var selectedScriptContent: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Content").font(.callout).foregroundStyle(.secondary)
+            if model.isLoadingSelectedScript {
+                Text("Loading…").font(.callout).foregroundStyle(.secondary)
+            } else if model.scriptInspectError != nil {
+                EmptyView()
+            } else if model.selectedScriptBytes == nil {
+                Text("No script body.").font(.callout).foregroundStyle(.secondary)
+            } else if let source = model.selectedScriptSource {
+                ScrollView {
+                    Text(displayedSource(source))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 140)
+                .padding(6)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(.separator))
+            } else {
+                Text("This script is not valid UTF-8 text.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func displayedSource(_ source: String) -> String {
+        let limit = 12_000
+        guard source.count > limit else { return source }
+        return String(source.prefix(limit)) + "\n… (truncated)"
     }
 
     private var limitations: some View {
